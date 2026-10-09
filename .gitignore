@@ -60,3 +60,7 @@ dist/
 
 # Buildkite CLI's per-checkout state, written by `bk` on first use.
 .bk.yaml
+
+# Native Windows CI wheel and smoke-test outputs
+artifacts/windows-x64/
+artifacts/windows-arm64/

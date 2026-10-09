@@ -104,6 +104,20 @@ The AMD and Intel bootstrap scripts additionally handle:
 - **PR labels**: `ready-run-all-tests` forces all tests including optional/nightly. `ci-no-fail-fast` disables fail-fast mode.
 - **ECR cache resolution**: Resolves multi-layer cache sources with a fallback chain (PR-specific -> base branch -> main).
 
+### Windows CUDA CI (Private Pools)
+
+The standalone [Windows pipeline](.buildkite/pipelines/windows.yml) builds CUDA
+wheels for **Windows x64 and arm64** from
+[`vortex-captain/vllm-windows`'s `v029_win_arm64` branch](https://github.com/vortex-captain/vllm-windows/tree/v029_win_arm64).
+Both native Windows jobs use the same resolved source commit, publish wheels
+and checksums, and run an installed-wheel CUDA kernel smoke test. They do not
+use the Linux pipeline generator or Docker.
+
+See [Windows private-pool setup](buildkite/windows/README.md) for queue
+configuration, required toolchains/private ARM64 PyTorch dependencies, source
+pinning, and Buildkite pipeline setup. The pools must be provisioned separately;
+this pipeline does not create Windows machines or modify the vLLM fork.
+
 ## Infrastructure
 
 ### AWS (Primary)

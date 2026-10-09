@@ -5,6 +5,8 @@ on:
     paths:
       - ".github/workflows/pipeline-generator-tests.yml"
       - "buildkite/pipeline_generator/**"
+      - "buildkite/windows/**"
+      - ".buildkite/pipelines/windows.yml"
       - "buildkite/tests/**"
       - "buildkite/ci_selector/recorders/**"
       - "pyproject.toml"
