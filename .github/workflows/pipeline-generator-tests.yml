@@ -7,6 +7,7 @@ on:
       - "buildkite/pipeline_generator/**"
       - "buildkite/windows/**"
       - ".buildkite/pipelines/windows.yml"
+      - ".buildkite/pipelines/windows-arm64.yml"
       - "buildkite/tests/**"
       - "buildkite/ci_selector/recorders/**"
       - "pyproject.toml"

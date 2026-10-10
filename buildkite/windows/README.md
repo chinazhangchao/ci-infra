@@ -6,13 +6,18 @@ builds **both x64 and arm64** from
 It runs directly on Windows, without Docker, WSL, AWS, or Kubernetes.
 Existing Linux pipelines and the Linux-oriented pipeline generator are unchanged.
 
+For **ARM64 only**, upload
+[windows-arm64.yml](../../.buildkite/pipelines/windows-arm64.yml) instead.
+This preserves the combined pipeline's x64 settings and requires only an
+ARM64 queue and agent.
+
 The resolver freezes the branch tip in Buildkite metadata once per build. Both
 architectures, including retries, fetch that same SHA into separate temporary
 checkouts. x64 builds with MSVC; arm64 invokes the fork's
 `tools\build-win-arm64.ps1` rather than duplicating its CUDA overlays, compiler
 selection, and Rust/OpenSSL workarounds. Neither job uses a precompiled vLLM.
 
-Each job builds a wheel, checks its platform tags and compiled extension,
+Each build job produces a wheel, checks its platform tags and compiled extension,
 installs it into a temporary target **without changing the agent's Python
 environment**, and executes the wheel's CUDA `silu_and_mul` kernel against a
 PyTorch reference. A missing GPU, incorrect architecture, build failure, or
@@ -105,12 +110,15 @@ packages, and checks that it is a real venv with the expected Python version
 and architecture **before** installing dependencies. Builds and smoke tests use
 that venv's `Scripts\python.exe`; you do not need to activate it manually.
 
-Create two self-hosted Buildkite queues, defaulting to `windows-x64` and
-`windows-arm64`. Give this pipeline access to those queues in your private
-cluster. Queue names can be changed with `WINDOWS_X64_QUEUE` and
-`WINDOWS_ARM64_QUEUE` **on the pipeline upload step**.
+For the ARM64-only pipeline, create a self-hosted Buildkite queue named
+`windows-arm64` in the pipeline's cluster and give the pipeline access to it.
+The upload, source-resolution and build steps all run on this queue. The
+combined `windows.yml` pipeline also requires `windows-x64` in the same cluster;
+its source-resolution step runs on x64. For custom queue names, set
+`WINDOWS_ARM64_QUEUE` and, for the combined pipeline, `WINDOWS_X64_QUEUE`
+**on the pipeline upload step**, and route that initial step to an existing queue.
 
-Both pools need:
+Provisioned pools need:
 
 - Native Windows and an NVIDIA GPU/driver supported by their CUDA toolkit.
   ARM64 means native Windows ARM64, not an x64 Python running under emulation.
@@ -429,18 +437,22 @@ not a successful vLLM compilation; run the Windows pipeline to establish that.
 ## Create and run the Buildkite pipeline
 
 Create a Buildkite pipeline with **this ci-infra repository** as its repository,
-not the vLLM fork. Set its initial steps to:
+not the vLLM fork. For **ARM64 only**, set its initial steps to:
 
 ```yaml
 steps:
-  - label: ":pipeline: Upload Windows CUDA pipeline"
+  - label: ":pipeline: Upload Windows ARM64 CUDA pipeline"
     agents:
-      queue: windows-x64
-    command: 'buildkite-agent pipeline upload .buildkite\pipelines\windows.yml'
+      queue: windows-arm64
+    command: 'buildkite-agent pipeline upload .buildkite\pipelines\windows-arm64.yml'
 ```
 
+To build **both x64 and ARM64**, upload `.buildkite\pipelines\windows.yml`
+instead and ensure both queues exist. Its x64 configuration is unchanged.
+
 For custom queue names, change the initial step's queue and set
-`WINDOWS_X64_QUEUE` / `WINDOWS_ARM64_QUEUE` in its environment before upload.
+`WINDOWS_ARM64_QUEUE` (and `WINDOWS_X64_QUEUE` for the combined pipeline)
+in its environment before upload.
 No upstream vLLM Buildkite queues or credentials are needed.
 
 Run manually, on a schedule, or trigger this pipeline from your fork's trusted
@@ -464,7 +476,7 @@ accounts unprivileged and avoid production credentials.
 
 ## Outputs and local checks
 
-Each architecture uploads `artifacts/windows-<architecture>/**/*`: its wheel,
+Each selected architecture uploads `artifacts/windows-<architecture>/**/*`: its wheel,
 SHA-256 checksum, source/ci-infra commit provenance, Python/Torch runtime
 metadata, and `smoke.json` on success. Compilation and failure output is in the
 Buildkite job log. A wheel may be uploaded for diagnosis after a failed smoke

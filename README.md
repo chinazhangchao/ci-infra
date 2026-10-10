@@ -112,10 +112,13 @@ wheels for **Windows x64 and arm64** from
 Both native Windows jobs use the same resolved source commit, publish wheels
 and checksums, and run an installed-wheel CUDA kernel smoke test. They do not
 use the Linux pipeline generator or Docker.
+For ARM64-only builds, use
+[windows-arm64.yml](.buildkite/pipelines/windows-arm64.yml); the combined
+pipeline's x64 settings remain unchanged.
 
 See [Windows private-pool setup](buildkite/windows/README.md) for queue
 configuration, required toolchains/private ARM64 PyTorch dependencies, source
-pinning, and Buildkite pipeline setup. The pools must be provisioned separately;
+pinning, and Buildkite pipeline setup. The selected pools must be provisioned separately;
 this pipeline does not create Windows machines or modify the vLLM fork.
 
 ## Infrastructure

@@ -1,0 +1,22 @@
+# ARM64-only entrypoint; windows.yml retains the combined x64/ARM64 pipeline.
+steps:
+  - label: ":windows: Resolve vLLM source"
+    key: windows-source
+    agents:
+      queue: "${WINDOWS_ARM64_QUEUE:-windows-arm64}"
+    command: 'python buildkite\windows\ci.py resolve'
+    timeout_in_minutes: 10
+
+  - label: ":windows: CUDA wheel and smoke test (arm64)"
+    key: windows-cuda-arm64
+    depends_on: windows-source
+    agents:
+      queue: "${WINDOWS_ARM64_QUEUE:-windows-arm64}"
+    command: 'python buildkite\windows\ci.py build --architecture arm64'
+    artifact_paths:
+      - "artifacts/windows-arm64/**/*"
+    timeout_in_minutes: 360
+    retry:
+      automatic:
+        - exit_status: -1
+          limit: 1

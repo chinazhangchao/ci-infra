@@ -57,21 +57,38 @@ def provisioned_environment(tmp_path):
     }
 
 
-def test_pipeline_routes_both_native_architectures():
+@pytest.mark.parametrize(
+    "filename,architectures,resolver_architecture",
+    [
+        ("windows.yml", ("x64", "arm64"), "x64"),
+        ("windows-arm64.yml", ("arm64",), "arm64"),
+    ],
+)
+def test_pipeline_routes_selected_native_architectures(
+    filename, architectures, resolver_architecture
+):
     pipeline = yaml.safe_load(
-        (ROOT / ".buildkite" / "pipelines" / "windows.yml").read_text()
+        (ROOT / ".buildkite" / "pipelines" / filename).read_text()
     )
-    source, x64, arm64 = pipeline["steps"]
+    source, *builds = pipeline["steps"]
+    assert len(builds) == len(architectures)
     assert source["key"] == "windows-source"
     assert source["command"] == r"python buildkite\windows\ci.py resolve"
-    for architecture, step in (("x64", x64), ("arm64", arm64)):
+    variable = f"WINDOWS_{resolver_architecture.upper()}_QUEUE"
+    assert source["agents"] == {
+        "queue": f"${{{variable}:-windows-{resolver_architecture}}}"
+    }
+    for architecture, step in zip(architectures, builds):
         variable = f"WINDOWS_{architecture.upper()}_QUEUE"
         assert step["agents"] == {"queue": f"${{{variable}:-windows-{architecture}}}"}
+        assert step["key"] == f"windows-cuda-{architecture}"
         assert step["depends_on"] == source["key"]
         assert step["command"] == (
             rf"python buildkite\windows\ci.py build --architecture {architecture}"
         )
         assert step["artifact_paths"] == [f"artifacts/windows-{architecture}/**/*"]
+        assert step["timeout_in_minutes"] == {"x64": 240, "arm64": 360}[architecture]
+        assert step["retry"] == {"automatic": [{"exit_status": -1, "limit": 1}]}
         assert "plugins" not in step
         assert not step.get("soft_fail")
 
