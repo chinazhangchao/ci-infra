@@ -133,6 +133,14 @@ def build_environment(architecture, env):
         MAX_JOBS=str(jobs),
         CMAKE_BUILD_PARALLEL_LEVEL=str(jobs),
     )
+    # CMake-created clones and nested submodules do not inherit local Git config.
+    git_config_count = env.get("GIT_CONFIG_COUNT", "0")
+    if not re.fullmatch(r"[0-9]+", git_config_count):
+        raise ValueError("GIT_CONFIG_COUNT must be a non-negative integer.")
+    git_config_count = int(git_config_count)
+    env[f"GIT_CONFIG_KEY_{git_config_count}"] = "core.longpaths"
+    env[f"GIT_CONFIG_VALUE_{git_config_count}"] = "true"
+    env["GIT_CONFIG_COUNT"] = str(git_config_count + 1)
     env.pop("VLLM_PRECOMPILED_WHEEL_LOCATION", None)
     env.pop("VLLM_BUILD_BASE", None)
     env["PATH"] = os.pathsep.join(
@@ -188,6 +196,28 @@ def build_command(architecture, source, python, venv, output, env):
         if env.get(variable):
             command.extend([f"-{parameter}", env[variable]])
     return command
+
+
+def git_longpaths_environment(env, work):
+    prepared = dict(env)
+    if "GIT_CONFIG_GLOBAL" in env:
+        includes = [Path(env["GIT_CONFIG_GLOBAL"])] if env["GIT_CONFIG_GLOBAL"] else []
+    else:
+        home = Path(env.get("HOME") or env.get("USERPROFILE") or Path.home())
+        xdg = Path(env.get("XDG_CONFIG_HOME") or home / ".config")
+        includes = [xdg / "git" / "config", home / ".gitconfig"]
+    config = work / "git-longpaths.config"
+    content = ""
+    if includes:
+        content = "[include]\n" + "".join(
+            f"    path = {json.dumps(str(path.absolute()), ensure_ascii=False)}\n"
+            for path in includes
+        )
+    content += "[core]\n    longpaths = true\n"
+    with config.open("x", encoding="utf-8") as stream:
+        stream.write(content)
+    prepared["GIT_CONFIG_GLOBAL"] = str(config)
+    return prepared
 
 
 def validate_wheel(output, architecture):
@@ -276,20 +306,32 @@ def build(architecture):
     work_root = Path(required(env, "VLLM_WINDOWS_WORK_ROOT")).resolve()
     work_root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="vllm-", dir=work_root) as work:
+        env = git_longpaths_environment(env, Path(work))
         source = Path(work) / "src"
         source.mkdir()
-        run(["git", "init", str(source)])
-        run(["git", "-C", source, "config", "core.longpaths", "true"])
-        run(["git", "-C", source, "remote", "add", "origin", REPOSITORY])
+        run(["git", "init", str(source)], env=env)
+        run(["git", "-C", source, "config", "core.longpaths", "true"], env=env)
+        run(["git", "-C", source, "remote", "add", "origin", REPOSITORY], env=env)
         # setuptools-scm needs tags and history for the x64 wheel version.
-        run(["git", "-C", source, "fetch", "--tags", "origin", source_info["commit"]])
-        run(["git", "-C", source, "checkout", "--detach", source_info["commit"]])
-        actual_commit = run(["git", "-C", source, "rev-parse", "HEAD"], capture=True)
+        run(
+            ["git", "-C", source, "fetch", "--tags", "origin", source_info["commit"]],
+            env=env,
+        )
+        run(
+            ["git", "-C", source, "checkout", "--detach", source_info["commit"]],
+            env=env,
+        )
+        actual_commit = run(
+            ["git", "-C", source, "rev-parse", "HEAD"], env=env, capture=True
+        )
         if actual_commit.lower() != source_info["commit"].lower():
             raise ValueError(
                 f"Checked out an unexpected source commit: {actual_commit}"
             )
-        run(["git", "-C", source, "submodule", "update", "--init", "--recursive"])
+        run(
+            ["git", "-C", source, "submodule", "update", "--init", "--recursive"],
+            env=env,
+        )
         command = build_command(architecture, source, python, venv, output, env)
         run(command, cwd=source, env=env)
         wheel = validate_wheel(output, architecture)

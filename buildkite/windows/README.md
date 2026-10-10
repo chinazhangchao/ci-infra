@@ -135,7 +135,11 @@ Provisioned pools need:
   provision their caches. Use a short writable build root, such as `C:\b`,
   with adequate disk space for fresh checkouts and compilation.
 - Windows long paths enabled by the pool administrator. Git long-path support
-  is enabled only in each job's temporary source checkout.
+  is enabled through a temporary per-job Git config, including CMake dependency
+  clones and recursive submodule checkouts. The temporary config includes the
+  existing user config (or `GIT_CONFIG_GLOBAL` override) and is removed with the
+  build workspace. Existing process-scoped settings are retained; user and
+  system Git config files are not modified.
 
 **x64:** The automated toolchain stage uses the fork's Windows README's Torch/CUDA/compiler
 combination (currently Torch `2.11.0+cu130` and CUDA 13). Provision from

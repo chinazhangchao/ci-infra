@@ -193,6 +193,181 @@ def test_build_environment_does_not_reuse_precompiled_wheels(tmp_path):
     assert env["VLLM_USE_PRECOMPILED"] == "1"
 
 
+@pytest.mark.parametrize("architecture", ["x64", "arm64"])
+@pytest.mark.parametrize("count", [None, "0", "2"])
+def test_build_environment_appends_git_longpaths(tmp_path, architecture, count):
+    env = provisioned_environment(tmp_path)
+    env["GIT_CONFIG_PARAMETERS"] = "'fetch.prune=true'"
+    if count is not None:
+        env["GIT_CONFIG_COUNT"] = count
+    if count == "2":
+        env.update(
+            GIT_CONFIG_KEY_0="core.autocrlf",
+            GIT_CONFIG_VALUE_0="input",
+            GIT_CONFIG_KEY_1="core.longpaths",
+            GIT_CONFIG_VALUE_1="false",
+        )
+    original = dict(env)
+    _, _, prepared = ci.build_environment(architecture, env)
+    index = int(count or "0")
+    assert prepared["GIT_CONFIG_COUNT"] == str(index + 1)
+    assert prepared[f"GIT_CONFIG_KEY_{index}"] == "core.longpaths"
+    assert prepared[f"GIT_CONFIG_VALUE_{index}"] == "true"
+    for name, value in original.items():
+        if name.startswith("GIT_CONFIG_") and name != "GIT_CONFIG_COUNT":
+            assert prepared[name] == value
+    assert env == original
+
+
+@pytest.mark.parametrize("mode", ["home", "profile", "xdg", "explicit", "disabled"])
+def test_job_git_config_preserves_existing_settings(tmp_path, monkeypatch, mode):
+    monkeypatch.chdir(tmp_path)
+    home = tmp_path / "user home"
+    env = {"HOME": str(home), "USERPROFILE": str(home), "GIT_CONFIG_COUNT": "0"}
+    expected = [home / ".config" / "git" / "config", home / ".gitconfig"]
+    if mode == "profile":
+        del env["HOME"]
+    elif mode == "xdg":
+        env["XDG_CONFIG_HOME"] = str(tmp_path / "xdg config")
+        expected[0] = tmp_path / "xdg config" / "git" / "config"
+    elif mode == "explicit":
+        env["GIT_CONFIG_GLOBAL"] = "custom global.config"
+        expected = [tmp_path / "custom global.config"]
+    elif mode == "disabled":
+        env["GIT_CONFIG_GLOBAL"] = ""
+        expected = []
+    original = dict(env)
+    prepared = ci.git_longpaths_environment(env, tmp_path)
+    config = Path(prepared["GIT_CONFIG_GLOBAL"])
+    content = config.read_text()
+    includes = [
+        json.loads(line.split("=", 1)[1].strip())
+        for line in content.splitlines()
+        if line.strip().startswith("path =")
+    ]
+    assert includes == [str(path) for path in expected]
+    assert content.endswith("[core]\n    longpaths = true\n")
+    assert prepared["GIT_CONFIG_COUNT"] == "0"
+    assert env == original
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32" or not shutil.which("git"),
+    reason="Exercises Git for Windows long-path checkout behavior",
+)
+def test_build_environment_reaches_nested_git_checkouts(tmp_path_factory):
+    tmp_path = tmp_path_factory.mktemp("git")
+    git = shutil.which("git")
+    env = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    global_config = tmp_path / "user gitconfig"
+    global_content = "[core]\n\tlongpaths = false\n[test]\n\tpreserved = original\n"
+    global_config.write_text(global_content)
+    env.update(
+        GIT_CONFIG_NOSYSTEM="1",
+        GIT_CONFIG_GLOBAL=str(global_config),
+        GIT_CONFIG_COUNT="1",
+        GIT_CONFIG_KEY_0="protocol.file.allow",
+        GIT_CONFIG_VALUE_0="always",
+        LC_ALL="C",
+    )
+
+    def setup_git(*args):
+        result = subprocess.run(
+            [
+                git,
+                "-c",
+                "core.longpaths=true",
+                "-c",
+                "user.name=CI Test",
+                "-c",
+                "user.email=ci-test@example.invalid",
+                *map(str, args),
+            ],
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    dependency = tmp_path / "dependency"
+    setup_git("init", dependency)
+    relative = (
+        Path("library")
+        / ("operation_" + "x" * 25)
+        / ("device_" + "y" * 25)
+        / "instance.txt"
+    )
+    (dependency / relative).parent.mkdir(parents=True)
+    (dependency / relative).write_text("nested dependency")
+    setup_git("-C", dependency, "add", ".")
+    setup_git("-C", dependency, "commit", "-m", "Dependency fixture")
+
+    upstream = tmp_path / "upstream"
+    setup_git("init", upstream)
+    setup_git(
+        "-C", upstream, "submodule", "add", dependency.as_uri(), "csrc/dependency"
+    )
+    setup_git("-C", upstream, "commit", "-m", "Submodule fixture")
+    workspace = tmp_path / "workspace"
+    setup_git("init", workspace)
+    setup_git("-C", workspace, "config", "core.longpaths", "true")
+
+    inputs = {**env, **provisioned_environment(tmp_path)}
+    inputs["PATH"] = env["PATH"]
+    _, _, prepared = ci.build_environment("arm64", inputs)
+    prepared = ci.git_longpaths_environment(prepared, tmp_path)
+    assert ci.run(
+        [git, "config", "--get", "test.preserved"],
+        cwd=workspace,
+        env=prepared,
+        capture=True,
+    ) == "original"
+    for enabled, child_env in ((False, env), (True, prepared)):
+        mode = "enabled" if enabled else "disabled"
+        prefix = workspace / ".deps"
+        # Keep Git's object-store paths short; exercise long worktree paths.
+        padding = max(1, 160 - len(str(prefix)) - len(mode) - 2)
+        destination = prefix / (mode + "-" + "x" * padding)
+        checked_out = destination / "csrc" / "dependency" / relative
+        assert len(str(checked_out)) > 260
+        pack = (
+            destination
+            / ".git"
+            / "modules"
+            / "csrc"
+            / "dependency"
+            / "objects"
+            / "pack"
+            / ("pack-" + "0" * 40 + ".keep")
+        )
+        assert len(str(pack)) < 260
+        result = subprocess.run(
+            [
+                git,
+                "clone",
+                "--quiet",
+                "--recurse-submodules",
+                upstream.as_uri(),
+                str(destination),
+            ],
+            cwd=workspace,
+            env=child_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if enabled:
+            assert result.returncode == 0, result.stderr
+            assert checked_out.read_text() == "nested dependency"
+        else:
+            assert result.returncode != 0
+            assert "Filename too long" in result.stderr
+    assert global_config.read_text() == global_content
+
+
 @pytest.mark.parametrize(
     "variable,value",
     [
@@ -201,6 +376,9 @@ def test_build_environment_does_not_reuse_precompiled_wheels(tmp_path):
         ("VLLM_WINDOWS_VENV", ""),
         ("MAX_JOBS", "0"),
         ("MAX_JOBS", "257"),
+        ("GIT_CONFIG_COUNT", "-1"),
+        ("GIT_CONFIG_COUNT", "invalid"),
+        ("GIT_CONFIG_COUNT", ""),
     ],
 )
 def test_build_environment_rejects_missing_or_invalid_settings(
@@ -312,6 +490,13 @@ def test_build_lifecycle(tmp_path, monkeypatch, architecture, failure):
         assert "--tags" in fetch and "--depth=1" not in fetch
     if failure in ("compile", "wrong-python", "no-gpu", "wrong-source"):
         assert not any(str(ci.HERE / "smoke.py") in args for args, _ in calls)
+    for args, options in calls:
+        if args[0] == "git" or args == ["compile-wheel"]:
+            child_env = options["env"]
+            assert child_env["GIT_CONFIG_COUNT"] == prepared[2]["GIT_CONFIG_COUNT"]
+            config = Path(child_env["GIT_CONFIG_GLOBAL"])
+            assert config.name == "git-longpaths.config"
+            assert not config.exists()
 
 
 def test_build_rejects_dirty_output_directory(tmp_path, monkeypatch):
