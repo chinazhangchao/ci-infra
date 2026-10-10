@@ -37,8 +37,8 @@ partial-json-parser
 jsonschema>=4.23.0
 pyzmq>=25.0.0
 msgspec
-mistral-common[image]>=1.11.6
-opencv-python-headless>=4.13.0
+# The optional [image] extra would pull OpenCV back in.
+mistral-common>=1.11.6
 pyyaml
 six>=1.16.0
 setuptools>=77.0.3,<81.0.0

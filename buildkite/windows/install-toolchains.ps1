@@ -90,6 +90,11 @@ function Set-ToolchainDirectoryPermissions {
 
 function Get-InstalledMsvcVersion {
     param([string]$VisualStudio, [string]$Family, [string]$Target, [switch]$Optional)
+    $vcvars = Join-Path $VisualStudio "VC\Auxiliary\Build\vcvarsall.bat"
+    if (-not (Test-Path -LiteralPath $vcvars -PathType Leaf)) {
+        if ($Optional) { return $null }
+        throw "Visual Studio C++ environment script is missing: $vcvars. Install the current $Target C++ tools and Microsoft.VisualStudio.Component.VC.CoreBuildTools."
+    }
     $toolsets = Join-Path $VisualStudio "VC\Tools\MSVC"
     $versions = @()
     if (Test-Path -LiteralPath $toolsets) {
@@ -163,6 +168,17 @@ function Install-MsvcToolchains {
     if ($components.Count) {
         $major = if ($Target -eq "arm64") { "18" } else { "17" }
         $vs = Join-Path $Root "vs$major"
+        if ((-not $cudaVs -or -not $rustVs) -and
+            -not (Test-Path -LiteralPath (Join-Path $vs "VC\Auxiliary\Build\vcvarsall.bat") -PathType Leaf)) {
+            # Legacy toolsets and CoreBuildTools lack vcvarsall.bat; current tools supply it.
+            $currentTools = if ($Target -eq "arm64") {
+                "Microsoft.VisualStudio.Component.VC.Tools.ARM64"
+            } else {
+                "Microsoft.VisualStudio.Component.VC.Tools.x86.x64"
+            }
+            if ($currentTools -notin $components) { $components += $currentTools }
+            $components += "Microsoft.VisualStudio.Component.VC.CoreBuildTools"
+        }
         # VS 18.6.3 carries MSVC 14.51; a moving Stable channel could select 14.52.
         $url = if ($Target -eq "arm64") {
             "https://download.visualstudio.microsoft.com/download/pr/471731ab-b194-4597-af69-194c13cb642c/3fb30c58cf04776a188dd7c6480f0a9b1a6f74202e755223947a33bfbf23d133/vs_BuildTools.exe"
@@ -422,6 +438,7 @@ function Install-WindowsToolchains {
         (Join-Path $parameters.ProtocIncludePath "google\protobuf\struct.proto"),
         (Join-Path $cuda "bin\nvcc.exe"), (Join-Path $cuda "lib\$Target\cudart.lib"),
         (Join-Path $parameters.VisualStudioPath "VC\Auxiliary\Build\vcvarsall.bat"),
+        (Join-Path $parameters.RustVisualStudioPath "VC\Auxiliary\Build\vcvarsall.bat"),
         (Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\Include\10.0.26100.0\um\Windows.h")
     )
     foreach ($file in $files) {

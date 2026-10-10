@@ -246,7 +246,12 @@ if ($pair -and $pair.RustcExecutable -eq {literal(proxy)}) {{ throw 'Saved profi
 
 
 @pytest.mark.parametrize("missing", ["none", "cuda", "rust", "sdk"])
-def test_msvc_installs_only_missing_components(tmp_path, missing):
+@pytest.mark.parametrize("has_environment", [False, True])
+def test_msvc_installs_only_missing_components(tmp_path, missing, has_environment):
+    if has_environment:
+        vcvars = tmp_path / "vs18" / "VC" / "Auxiliary" / "Build" / "vcvarsall.bat"
+        vcvars.parent.mkdir(parents=True)
+        vcvars.touch()
     output = tmp_path / "components.json"
     result = run_ps(
         tmp_path,
@@ -285,16 +290,86 @@ if ('{missing}' -ne 'rust' -and $parameters.RustVisualStudioPath -ne 'existing-r
         assert not output.exists()
     else:
         arguments = json.loads(output.read_text())
-        assert arguments.count("--add") == 1
-        component = arguments[arguments.index("--add") + 1]
-        assert (
-            component
-            == {
+        components = {
+            arguments[index + 1]
+            for index, argument in enumerate(arguments)
+            if argument == "--add"
+        }
+        expected = {
+            {
                 "cuda": "Microsoft.VisualStudio.Component.VC.Tools.ARM64",
                 "rust": "Microsoft.VisualStudio.Component.VC.14.44.17.14.ARM64",
                 "sdk": "Microsoft.VisualStudio.Component.Windows11SDK.26100",
             }[missing]
-        )
+        }
+        if missing in ("cuda", "rust") and not has_environment:
+            expected.add("Microsoft.VisualStudio.Component.VC.CoreBuildTools")
+            expected.add("Microsoft.VisualStudio.Component.VC.Tools.ARM64")
+        assert components == expected
+        assert arguments.count("--add") == len(expected)
+
+
+@pytest.mark.parametrize("environment_installed", [False, True])
+def test_msvc_repairs_separate_rust_environment(tmp_path, environment_installed):
+    root = tmp_path / "managed"
+    cuda_vs = tmp_path / "existing-cuda"
+    rust_vs = root / "vs18"
+    vcvars_relative = Path("VC") / "Auxiliary" / "Build" / "vcvarsall.bat"
+    for vs, version in [(cuda_vs, "14.51.36231"), (rust_vs, "14.44.35207")]:
+        toolset = vs / "VC" / "Tools" / "MSVC" / version
+        for relative in [
+            Path("bin") / "HostARM64" / "arm64" / "cl.exe",
+            Path("bin") / "HostARM64" / "arm64" / "link.exe",
+            Path("include") / "vcruntime.h",
+            Path("lib") / "arm64" / "libcmt.lib",
+        ]:
+            file = toolset / relative
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.touch()
+        (vs / vcvars_relative).parent.mkdir(parents=True, exist_ok=True)
+    (cuda_vs / vcvars_relative).touch()
+    devshell = rust_vs / "Common7" / "Tools" / "Launch-VsDevShell.ps1"
+    devshell.parent.mkdir(parents=True)
+    devshell.touch()
+    output = tmp_path / "arguments.json"
+    result = run_ps(
+        tmp_path,
+        f"""
+. {literal(TOOLCHAINS)}
+function Get-VisualStudioPaths {{ return @({literal(cuda_vs)}, {literal(rust_vs)}) }}
+function Test-WindowsSdk {{ return $true }}
+function Get-ToolchainPayload {{ return 'never-executed.exe' }}
+function Invoke-ToolchainInstaller {{
+    param($File, $Arguments)
+    $Arguments | ConvertTo-Json | Set-Content {literal(output)}
+    if (${str(environment_installed).lower()} -and
+        $Arguments -contains 'Microsoft.VisualStudio.Component.VC.Tools.ARM64' -and
+        $Arguments -contains 'Microsoft.VisualStudio.Component.VC.CoreBuildTools') {{
+        [IO.File]::WriteAllText({literal(rust_vs / vcvars_relative)}, '')
+    }}
+}}
+$parameters = Install-MsvcToolchains {literal(root)} {literal(tmp_path)} 'arm64'
+if ($parameters.VisualStudioPath -ne {literal(cuda_vs)} -or
+    $parameters.RustVisualStudioPath -ne {literal(rust_vs)} -or
+    $parameters.MsvcToolsetVersion -ne '14.51.36231' -or
+    $parameters.RustMsvcToolsetVersion -ne '14.44.35207') {{
+    throw 'Incorrect compiler configuration after repair'
+}}
+function Invoke-ToolchainInstaller {{ throw 'Repaired toolchains should be reused' }}
+[void](Install-MsvcToolchains {literal(root)} {literal(tmp_path)} 'arm64')
+""",
+    )
+    arguments = json.loads(output.read_text())
+    assert arguments[0] == "modify"
+    assert arguments[arguments.index("--installPath") + 1] == str(rust_vs)
+    assert "Microsoft.VisualStudio.Component.VC.CoreBuildTools" in arguments
+    assert "Microsoft.VisualStudio.Component.VC.14.44.17.14.ARM64" in arguments
+    assert arguments.count("Microsoft.VisualStudio.Component.VC.Tools.ARM64") == 1
+    if environment_installed:
+        assert result.returncode == 0, result.stderr
+    else:
+        assert result.returncode != 0
+        assert "Visual Studio C++ environment script is missing" in result.stderr
 
 
 @pytest.mark.parametrize(
@@ -505,8 +580,14 @@ if (-not $script:ToolchainRebootRequired) {{ throw 'Lost reboot requirement' }}
     assert marker.read_text(encoding="utf-8-sig").strip() == "boot-1"
 
 
-@pytest.mark.parametrize("missing", ["none", "linker", "headers", "libraries"])
+@pytest.mark.parametrize(
+    "missing", ["none", "environment", "linker", "headers", "libraries"]
+)
 def test_msvc_requires_complete_target_toolset(tmp_path, missing):
+    vcvars = tmp_path / "VC" / "Auxiliary" / "Build" / "vcvarsall.bat"
+    vcvars.parent.mkdir(parents=True)
+    if missing != "environment":
+        vcvars.touch()
     toolset = tmp_path / "VC" / "Tools" / "MSVC" / "14.44.35207"
     files = [
         "bin/Hostx64/x64/cl.exe",
@@ -529,6 +610,14 @@ def test_msvc_requires_complete_target_toolset(tmp_path, missing):
 . {literal(TOOLCHAINS)}
 $version = Get-InstalledMsvcVersion {literal(tmp_path)} '14.44' 'x64' -Optional
 if ([bool]$version -ne ${str(missing == "none").lower()}) {{ throw 'Incorrect MSVC completeness detection' }}
+if ('{missing}' -eq 'environment') {{
+    Get-InstalledMsvcVersion {literal(tmp_path)} '14.44' 'x64'
+}}
 """,
     )
-    assert result.returncode == 0, result.stderr
+    if missing == "environment":
+        assert result.returncode != 0
+        assert "Visual Studio C++ environment script is missing" in result.stderr
+        assert "Microsoft.VisualStudio.Component.VC.CoreBuildTools" in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr

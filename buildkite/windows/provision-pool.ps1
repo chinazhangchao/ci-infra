@@ -118,9 +118,12 @@ function Resolve-RequiredPath {
 }
 
 function Resolve-VcVars {
-    param([string]$Path)
+    param([string]$Path, [string]$ParameterName = "VisualStudioPath")
     if (Test-Path -LiteralPath $Path -PathType Container) {
         $Path = Join-Path $Path "VC\Auxiliary\Build\vcvarsall.bat"
+    }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "$ParameterName is missing the Visual Studio C++ environment script: $Path. Rerun -InstallToolchains as Administrator to install missing components and regenerate toolchains.json."
     }
     return Resolve-RequiredPath $Path Leaf
 }
@@ -276,7 +279,7 @@ function Invoke-PoolProvisioning {
     $rustVcvars = $vcvars
     if ($Architecture -eq "arm64") {
         if ($RustVisualStudioPath) {
-            $rustVcvars = Resolve-VcVars $RustVisualStudioPath
+            $rustVcvars = Resolve-VcVars $RustVisualStudioPath -ParameterName "RustVisualStudioPath"
         }
         Assert-Arm64Toolset $vcvars $MsvcToolsetVersion
         Assert-Arm64Toolset $rustVcvars $RustMsvcToolsetVersion

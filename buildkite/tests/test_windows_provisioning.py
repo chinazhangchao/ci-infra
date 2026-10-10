@@ -94,6 +94,9 @@ def test_arm64_runtime_manifest_parses_and_does_not_pin_torch():
     assert {"flashinfer-python", "xformers", "tilelang", "instanttensor"}.isdisjoint(
         names
     )
+    assert {"opencv-python", "opencv-python-headless"}.isdisjoint(names)
+    mistral = next(req for req in requirements if req.name == "mistral-common")
+    assert not mistral.extras
     triton = next(req for req in requirements if req.name == "triton-windows")
     assert triton.specifier.contains("3.8.0.post29")
 
@@ -233,6 +236,33 @@ def test_arm64_toolset_checks_target_compiler(tmp_path, missing_compiler):
         assert result.returncode == 0, result.stderr
 
 
+@pytest.mark.parametrize("parameter", ["VisualStudioPath", "RustVisualStudioPath"])
+@pytest.mark.parametrize("missing", [False, True])
+@pytest.mark.parametrize("use_file", [False, True])
+def test_resolve_vcvars_reports_incomplete_installation(
+    tmp_path, parameter, missing, use_file
+):
+    vs = tmp_path / "Visual Studio"
+    vcvars = vs / "VC" / "Auxiliary" / "Build" / "vcvarsall.bat"
+    vcvars.parent.mkdir(parents=True)
+    if not missing:
+        vcvars.touch()
+    result = run_ps(
+        tmp_path,
+        load_provision(tmp_path)
+        + f"""
+$path = Resolve-VcVars {literal(vcvars if use_file else vs)} -ParameterName '{parameter}'
+if ($path -ne {literal(vcvars)}) {{ throw 'Incorrect environment script' }}
+""",
+    )
+    if missing:
+        assert result.returncode != 0
+        assert parameter in result.stderr
+        assert "Rerun -InstallToolchains as Administrator" in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr
+
+
 @pytest.mark.parametrize("architecture", ["x64", "arm64"])
 @pytest.mark.parametrize("bad_checksum", [False, True])
 def test_agent_download_verifies_checksum_before_extracting(
@@ -300,6 +330,9 @@ def test_provisioning_writes_complete_secret_free_pool(
 ):
     inputs = tmp_path / "inputs with spaces"
     inputs.mkdir()
+    vcvars = inputs / "VS" / "vcvarsall.bat"
+    vcvars.parent.mkdir()
+    vcvars.touch()
     requirements = inputs / "requirements.txt"
     requirements.write_text("placeholder manifest; native installs are mocked")
     if use_default:
@@ -323,7 +356,7 @@ $Wheelhouse = {literal(inputs)}
 $NoIndex = ${str(no_index).lower()}
 $CMakeCudaArchitectures = '120-real;103-real'
 $CudaPath = {literal(inputs / "CUDA")}
-$VisualStudioPath = {literal(inputs / "VS" / "vcvarsall.bat")}
+$VisualStudioPath = {literal(vcvars)}
 $ProtocIncludePath = {literal(inputs / "include")}
 $env:BUILDKITE_AGENT_TOKEN = 'unit-test-token-not-for-disk'
 $env:CUDA_HOME = 'original-cuda-home'
@@ -820,11 +853,13 @@ $result | ConvertTo-Json | Set-Content {literal(tmp_path / "vs-result.json")}
         "--quiet" in arguments and "--wait" in arguments and "--norestart" in arguments
     )
     assert "Microsoft.VisualStudio.Component.Windows11SDK.26100" in arguments
+    assert "Microsoft.VisualStudio.Component.VC.CoreBuildTools" in arguments
     if architecture == "arm64":
         assert "Microsoft.VisualStudio.Component.VC.Tools.ARM64" in arguments
         assert "Microsoft.VisualStudio.Component.VC.14.44.17.14.ARM64" in arguments
     else:
         assert "Microsoft.VisualStudio.Component.VC.14.44.17.14.x86.x64" in arguments
+        assert "Microsoft.VisualStudio.Component.VC.Tools.x86.x64" in arguments
     versions = json.loads((tmp_path / "vs-result.json").read_text())
     assert versions["MsvcToolsetVersion"].startswith(
         "14.51" if architecture == "arm64" else "14.44"
@@ -988,7 +1023,10 @@ def test_install_mode_dispatches_from_windows_powershell_51(tmp_path):
     sys.platform != "win32", reason="Uses local Windows toolchain paths"
 )
 @pytest.mark.parametrize("architecture", ["x64", "arm64"])
-def test_full_toolchain_orchestration_without_real_installers(tmp_path, architecture):
+@pytest.mark.parametrize("missing_rust_environment", [False, True])
+def test_full_toolchain_orchestration_without_real_installers(
+    tmp_path, architecture, missing_rust_environment
+):
     root = tmp_path / "machine tools"
     old_python = root / "python" / "python.exe"
     old_installer = root / "downloads" / "python.exe"
@@ -1057,9 +1095,10 @@ function Expand-Archive {{
 function Install-MsvcToolchains {{
     param($Root, $Downloads, $Target)
     $vs = Join-Path $Root 'vs'
+    $rustVs = if (${str(missing_rust_environment).lower()}) {{ Join-Path $Root 'incomplete-rust-vs' }} else {{ $vs }}
     Touch-File (Join-Path $vs 'VC\\Auxiliary\\Build\\vcvarsall.bat')
     Touch-File (Join-Path ${{env:ProgramFiles(x86)}} 'Windows Kits\\10\\Include\\10.0.26100.0\\um\\Windows.h')
-    return @{{VisualStudioPath=$vs; RustVisualStudioPath=$vs; MsvcToolsetVersion='14.51.36231';
+    return @{{VisualStudioPath=$vs; RustVisualStudioPath=$rustVs; MsvcToolsetVersion='14.51.36231';
              RustMsvcToolsetVersion='14.44.35207'; WindowsSdkVersion='10.0.26100.0'}}
 }}
 function Invoke-ToolchainInstaller {{
@@ -1099,6 +1138,12 @@ if ($env:CARGO_HOME -ne 'original-cargo' -or $env:RUSTUP_HOME -ne 'original-rust
     Set-Content {literal(tmp_path / "operations.json")}
 """,
     )
+    if missing_rust_environment:
+        assert result.returncode != 0
+        assert "Installer did not produce the required file" in result.stderr
+        assert "incomplete-rust-vs" in result.stderr
+        assert not (root / "toolchains.json").exists()
+        return
     assert result.returncode == 0, result.stderr
     configuration = json.loads(
         (root / "toolchains.json").read_text(encoding="utf-8-sig")

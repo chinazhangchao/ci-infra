@@ -27,6 +27,8 @@ or an end-to-end model inference test.
 an unprivileged agent account**. This separation keeps CI jobs from inheriting
 administrator privileges. Neither stage starts an agent, creates a service,
 or saves an agent token.
+Use a normal native PowerShell session, not a Visual Studio Developer shell;
+the build scripts initialize the compiler environment themselves.
 
 | Tool | Reused when detected | Installed only if no compatible tool is found |
 |------|----------------------|----------------------------------------------|
@@ -46,6 +48,25 @@ Python also uses machine registration, CUDA checks its registration/environment,
 and Visual Studio uses `vswhere` to find installed editions. MSVC compiler
 families can be reused from **different** Visual Studio installations. The log
 identifies reused tools and rejected incompatible candidates.
+Both paths can also use the same installation when it contains both required
+toolset versions. Missing compilers are installed under the managed toolchain
+root rather than added to an existing Visual Studio installation elsewhere.
+
+Both compiler installations must include `VC\Auxiliary\Build\vcvarsall.bat`.
+The legacy MSVC 14.44 component and `VC.CoreBuildTools` alone do not supply
+that script. When it is missing, the installer adds the current target tools
+component (`VC.Tools.ARM64` or `VC.Tools.x86.x64`) together with
+`Microsoft.VisualStudio.Component.VC.CoreBuildTools`. This may install current
+compiler support in the managed Rust installation even when the CUDA compiler
+is reused from another installation.
+If pool preparation reports a missing script in `VisualStudioPath` or
+`RustVisualStudioPath`, rerun the toolchain stage as Administrator with the same
+root (for example, `.\buildkite\windows\provision-pool.ps1 -Architecture arm64
+-InstallToolchains -ToolchainRoot 'C:\vllm-tools\arm64'`). This repairs missing
+components and regenerates `toolchains.json`; then retry pool preparation as
+the unprivileged agent account. Do not copy scripts between installations or
+point the Rust path at a CUDA-only installation without MSVC 14.44.
+
 Unreadable executables, including Windows App Execution Aliases such as
 `AppData\Local\Microsoft\WindowsApps\python.exe`, are warned about and skipped.
 Discovery continues to another compatible installation or installs the missing
@@ -252,12 +273,14 @@ loop and Triton dependencies. Numba 0.68.0, NVTX 0.2.16, fastsafetensors 0.4.0,
 and triton-windows 3.8.0.post29 replace older fork pins to use releases with
 Python 3.13 Windows ARM64 wheels.
 
-Some other dependencies (including tiktoken, outlines-core and OpenCV headless)
+Some other dependencies (including tiktoken and outlines-core)
 do not currently publish matching ARM64 wheels. Supply compatible builds in
 your wheelhouse rather than relying on public package availability. Without
 a matching wheel, pip may attempt a source build, which can still fail if
 the package does not support Windows ARM64. Provisioning does not suppress
-such failures. TileLang and
+such failures. OpenCV headless and the `mistral-common[image]` extra that pulls
+it in are omitted from this CI profile; OpenCV-dependent image/video features
+require a separate optional installation. TileLang and
 InstantTensor are optional acceleration/model-loading backends with no public
 Windows ARM64 wheels and are omitted from this build/kernel-smoke CI profile.
 The fork's x64-only dependencies are also excluded. This is not a claim of
