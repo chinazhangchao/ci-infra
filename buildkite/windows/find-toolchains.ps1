@@ -22,9 +22,11 @@ function Get-ToolCandidates {
 
 function Get-PeArchitecture {
     param([string]$Path)
-    $stream = [IO.File]::OpenRead($Path)
-    $reader = [IO.BinaryReader]::new($stream)
+    $stream = $null
+    $reader = $null
     try {
+        $stream = [IO.File]::OpenRead($Path)
+        $reader = [IO.BinaryReader]::new($stream)
         if ($stream.Length -lt 64 -or $reader.ReadUInt16() -ne 0x5a4d) { return "" }
         $stream.Position = 60
         $offset = $reader.ReadUInt32()
@@ -36,8 +38,16 @@ function Get-PeArchitecture {
             0xaa64 { return "arm64" }
             default { return "" }
         }
+    } catch [IO.IOException], [UnauthorizedAccessException] {
+        # Windows App Execution Aliases can be listed on PATH but cannot be read as PE files.
+        Write-Warning "Ignoring unreadable executable ${Path}: $($_.Exception.Message)"
+        return ""
     } finally {
-        $reader.Dispose()
+        if ($reader) {
+            $reader.Dispose()
+        } elseif ($stream) {
+            $stream.Dispose()
+        }
     }
 }
 
@@ -57,7 +67,7 @@ function Invoke-ToolProbe {
 }
 
 function Test-ToolCandidate {
-    param([string]$Kind, [string]$Path, [string]$Target, [string]$PythonVersion = "3.12.10",
+    param([string]$Kind, [string]$Path, [string]$Target, [string]$PythonVersion = "3.13.16",
           [string]$ProtocInclude = "")
     $machine = Get-PeArchitecture $Path
     $hostUtility = $Kind -in @("perl", "protobuf")
@@ -104,7 +114,7 @@ function Test-ToolCandidate {
 
 function Find-Tool {
     param([string]$Kind, [string]$Name, [string[]]$Paths, [string]$Target,
-          [string]$PythonVersion = "3.12.10", [string]$ProtocInclude = "")
+          [string]$PythonVersion = "3.13.16", [string]$ProtocInclude = "")
     foreach ($candidate in (Get-ToolCandidates $Name $Paths)) {
         if (Test-ToolCandidate $Kind $candidate $Target $PythonVersion $ProtocInclude) {
             Write-Host "Reusing $Kind at $candidate"

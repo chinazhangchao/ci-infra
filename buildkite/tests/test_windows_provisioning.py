@@ -203,7 +203,9 @@ if ($hash -ine {literal(digest)}) {{ throw 'Incorrect recorded hash' }}
 
 
 @pytest.mark.parametrize("architecture", ["x64", "arm64"])
-@pytest.mark.parametrize("failure", [None, "pip", "runtime"])
+@pytest.mark.parametrize(
+    "failure", [None, "pip", "runtime", "not-venv", "wrong-venv-version"]
+)
 def test_provisioning_writes_complete_secret_free_pool(tmp_path, architecture, failure):
     inputs = tmp_path / "inputs with spaces"
     inputs.mkdir()
@@ -265,8 +267,15 @@ function Invoke-CheckedCommand {{
         }}
     }}
     if ($Arguments -contains '-c') {{
-        if ($File -like '*venv*') {{ return {literal(json.dumps(runtime))} }}
-        return {literal(json.dumps({"platform": platform, "version": [3, 12]}))}
+        if ($Arguments[-1] -like '*sys.version_info*') {{
+            $info = @{{platform='{platform}'; version=@(3,13,16); is_venv=($File -like '*venv*')}}
+            if ($info.is_venv) {{
+                if ('{failure}' -eq 'not-venv') {{ $info.is_venv = $false }}
+                if ('{failure}' -eq 'wrong-venv-version') {{ $info.version = @(3,12,10) }}
+            }}
+            return ($info | ConvertTo-Json)
+        }}
+        return {literal(json.dumps(runtime))}
     }}
 }}
 function Install-PoolAgent {{
@@ -288,6 +297,8 @@ $script:commands | ConvertTo-Json -Depth 5 |
     pool = tmp_path / "pool"
     if failure:
         assert result.returncode != 0
+        if failure in ("not-venv", "wrong-venv-version"):
+            assert "The new venv must use the selected native Python" in result.stderr
         assert not (pool / "provisioning.json").exists()
         assert not (pool / "start-agent.ps1").exists()
         return
@@ -326,12 +337,42 @@ $script:commands | ConvertTo-Json -Depth 5 |
                 encoding="utf-8"
             )
     commands = json.loads((tmp_path / "commands.json").read_text(encoding="utf-8"))
+    creation = next(c for c in commands if "venv" in c["arguments"])
+    assert creation["arguments"] == ["-I", "-m", "venv", str(pool / "venv")]
+    assert "--system-site-packages" not in creation["arguments"]
+    for command in commands:
+        if "pip" in command["arguments"]:
+            assert Path(command["file"]) == pool / "venv" / "Scripts" / "python.exe"
     installation = next(c["arguments"] for c in commands if "install" in c["arguments"])
     assert "--isolated" in installation
     assert str(WINDOWS / "requirements-toolchain.txt") in installation
     assert "--no-index" in installation
     assert installation[installation.index("--find-links") + 1] == str(inputs)
     assert any("check" in c["arguments"] for c in commands)
+
+
+@pytest.mark.parametrize("version", [[3, 12, 10], [3, 14, 8], [3, 13, 15]])
+def test_pool_rejects_old_or_wrong_python_before_creating_venv(tmp_path, version):
+    result = run_ps(
+        tmp_path,
+        load_provision(tmp_path)
+        + f"""
+function Assert-NativeHost {{}}
+function Resolve-Tool {{ return 'test-python.exe' }}
+function Resolve-RequiredPath {{ param($Path, $Type); return $Path }}
+function Invoke-CheckedCommand {{
+    param($File, $Arguments)
+    if ($Arguments -contains 'venv' -or $Arguments -contains 'pip') {{
+        throw 'Must reject the Python version before installing anything'
+    }}
+    return {literal(json.dumps({"platform": "win-amd64", "version": version, "is_venv": False}))}
+}}
+Invoke-PoolProvisioning
+""",
+    )
+    assert result.returncode != 0
+    assert "PythonExecutable must be native win-amd64 Python 3.13" in result.stderr
+    assert not (tmp_path / "pool").exists()
 
 
 @pytest.mark.parametrize("failure", [None, "missing-token", "missing-marker"])
@@ -643,7 +684,7 @@ def test_install_mode_dispatches_from_windows_powershell_51(tmp_path):
     (tmp_path / "install-toolchains.ps1").write_text(
         "function Install-WindowsToolchains {\n"
         "param($Target,$Root,$CudaPath,$PythonVersion,$ExistingTools)\n"
-        "if ($Target -ne 'arm64' -or $PythonVersion -ne '3.12.10') { throw 'Wrong arguments' }\n"
+        "if ($Target -ne 'arm64' -or $PythonVersion -ne '3.13.16') { throw 'Wrong arguments' }\n"
         "'dispatched without running installers' | Set-Content (Join-Path $PSScriptRoot 'dispatched.txt')\n"
         "return 3010\n"
         "}\n"
@@ -676,6 +717,14 @@ def test_install_mode_dispatches_from_windows_powershell_51(tmp_path):
 @pytest.mark.parametrize("architecture", ["x64", "arm64"])
 def test_full_toolchain_orchestration_without_real_installers(tmp_path, architecture):
     root = tmp_path / "machine tools"
+    old_python = root / "python" / "python.exe"
+    old_installer = root / "downloads" / "python.exe"
+    for file in (old_python, old_installer):
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_bytes(b"old Python 3.12 must not be overwritten")
+    (root / ".vllm-toolchains.json").write_text(
+        json.dumps({"architecture": architecture})
+    )
     cuda = tmp_path / "CUDA"
     sdk = tmp_path / "program-files-x86"
     result = run_ps(
@@ -743,7 +792,7 @@ function Install-MsvcToolchains {{
 function Invoke-ToolchainInstaller {{
     param($File, $Arguments)
     $script:installers.Add(@{{file=$File; arguments=@($Arguments)}})
-    if ($File -like '*python.exe') {{
+    if ($File -like '*python-*.exe') {{
         $destination = ($Arguments | Where-Object {{ $_ -like 'TargetDir=*' }}).Substring(10)
         Touch-File (Join-Path $destination 'python.exe')
     }} elseif ($File -like '*rustup-init.exe') {{
@@ -764,11 +813,11 @@ function Invoke-CheckedCommand {{
         return 'Cuda compilation tools, release {"13.4" if architecture == "arm64" else "13.0"}'
     }}
     if ($File -like '*python.exe') {{
-        return '["3.12.10", "{"win-arm64" if architecture == "arm64" else "win-amd64"}"]'
+        return '["3.13.16", "{"win-arm64" if architecture == "arm64" else "win-amd64"}"]'
     }}
 }}
 $status = Install-WindowsToolchains '{architecture}' {literal(root)} `
-    {literal(cuda)} '3.12.10'
+    {literal(cuda)}
 if ($status -ne 0) {{ throw 'Unexpected installer status' }}
 if ($env:CARGO_HOME -ne 'original-cargo' -or $env:RUSTUP_HOME -ne 'original-rustup') {{
     throw 'Rust installation leaked environment changes'
@@ -783,6 +832,9 @@ if ($env:CARGO_HOME -ne 'original-cargo' -or $env:RUSTUP_HOME -ne 'original-rust
     )
     assert configuration["architecture"] == architecture
     parameters = configuration["parameters"]
+    assert Path(parameters["PythonExecutable"]) == root / "python-3.13" / "python.exe"
+    for file in (old_python, old_installer):
+        assert file.read_bytes() == b"old Python 3.12 must not be overwritten"
     for key in [
         "PythonExecutable",
         "PwshExecutable",
@@ -806,7 +858,7 @@ if ($env:CARGO_HOME -ne 'original-cargo' -or $env:RUSTUP_HOME -ne 'original-rust
         for url in urls
     )
     assert any(
-        f"python-3.12.10-{'arm64' if architecture == 'arm64' else 'amd64'}.exe" in url
+        f"python-3.13.16-{'arm64' if architecture == 'arm64' else 'amd64'}.exe" in url
         for url in urls
     )
     assert any("rustup-init.exe" in url for url in urls)

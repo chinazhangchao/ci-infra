@@ -5,7 +5,7 @@ param(
     [switch]$InstallToolchains,
     [string]$ToolchainRoot = "",
     [string]$ToolchainConfig = "",
-    [ValidatePattern('^3\.(10|11|12|13|14)\.\d+$')][string]$PythonVersion = "3.12.10",
+    [ValidatePattern('^3\.(10|11|12|13|14)\.\d+$')][string]$PythonVersion = "3.13.16",
     [string]$PythonExecutable = "",
     [string]$CudaPath = "",
     [string]$VisualStudioPath = "",
@@ -203,17 +203,17 @@ function Invoke-PoolProvisioning {
         throw "CMakeCudaArchitectures is required for ARM64 and must match CudaArchList."
     }
     $python = Resolve-Tool $PythonExecutable
-    $pythonInfo = Invoke-CheckedCommand $python @(
-        "-I", "-c",
-        "import json,sys,sysconfig; print(json.dumps(dict(platform=sysconfig.get_platform(),version=list(sys.version_info[:2]))))"
-    ) -Capture | ConvertFrom-Json
+    $pythonProbe = "import json,sys,sysconfig; print(json.dumps(dict(platform=sysconfig.get_platform(),version=list(sys.version_info[:3]),is_venv=sys.prefix!=sys.base_prefix)))"
+    $pythonInfo = Invoke-CheckedCommand $python @("-I", "-c", $pythonProbe) -Capture | ConvertFrom-Json
     $platform = if ($Architecture -eq "x64") { "win-amd64" } else { "win-arm64" }
+    $wantedPython = [version]$PythonVersion
+    $actualPython = [version]($pythonInfo.version -join ".")
     if (
         $pythonInfo.platform -cne $platform -or
-        $pythonInfo.version[0] -ne 3 -or
-        $pythonInfo.version[1] -lt 10 -or $pythonInfo.version[1] -gt 14
+        $actualPython.Major -ne $wantedPython.Major -or
+        $actualPython.Minor -ne $wantedPython.Minor -or $actualPython -lt $wantedPython
     ) {
-        throw "PythonExecutable must be native $platform Python 3.10-3.14."
+        throw "PythonExecutable must be native $platform Python $($wantedPython.Major).$($wantedPython.Minor), patch $($wantedPython.Build) or newer. Rerun -InstallToolchains to refresh an older ToolchainConfig."
     }
     $cuda = Resolve-RequiredPath $CudaPath Container
     foreach ($file in @("bin\nvcc.exe", "bin\ptxas.exe", "include\cuda.h")) {
@@ -284,6 +284,11 @@ function Invoke-PoolProvisioning {
     $venv = Join-Path $root "venv"
     Invoke-CheckedCommand $python @("-I", "-m", "venv", $venv)
     $venvPython = Join-Path $venv "Scripts\python.exe"
+    $venvInfo = Invoke-CheckedCommand $venvPython @("-I", "-c", $pythonProbe) -Capture | ConvertFrom-Json
+    if (-not $venvInfo.is_venv -or $venvInfo.platform -cne $platform -or
+        ($venvInfo.version -join ".") -ne ($pythonInfo.version -join ".")) {
+        throw "The new venv must use the selected native Python $actualPython."
+    }
     $buildRequirements = Join-Path $PSScriptRoot "requirements-toolchain.txt"
     $pipArguments = @(
         "-I", "-m", "pip", "--isolated", "--disable-pip-version-check", "install",

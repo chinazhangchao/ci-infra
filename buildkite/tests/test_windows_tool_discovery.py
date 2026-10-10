@@ -37,11 +37,12 @@ def pe_file(path, architecture):
         ("git", "x64", "x64", "git version 2.51.0.windows.1", True),
         ("git", "arm64", "x64", "git version 2.51.0", False),
         ("git", "x64", "x64", "git version 2.20.0", False),
-        ("python", "arm64", "arm64", "3.12.10 win-arm64", True),
-        ("python", "arm64", "arm64", "3.12.11 win-arm64", True),
-        ("python", "arm64", "arm64", "3.12.9 win-arm64", False),
-        ("python", "arm64", "arm64", "3.13.1 win-arm64", False),
-        ("python", "x64", "arm64", "3.12.10 win-amd64", False),
+        ("python", "arm64", "arm64", "3.13.16 win-arm64", True),
+        ("python", "arm64", "arm64", "3.13.17 win-arm64", True),
+        ("python", "arm64", "arm64", "3.13.15 win-arm64", False),
+        ("python", "arm64", "arm64", "3.12.10 win-arm64", False),
+        ("python", "arm64", "arm64", "3.14.8 win-arm64", False),
+        ("python", "x64", "arm64", "3.13.16 win-amd64", False),
         ("perl", "x64", "arm64", "perl-ok", True),
         ("perl", "arm64", "arm64", "perl-ok", True),
         ("perl", "x64", "arm64", "", False),
@@ -95,6 +96,66 @@ def test_find_tool_skips_incompatible_candidates(tmp_path):
 function Invoke-ToolProbe {{ return '7.4.13' }}
 $path = Find-Tool 'pwsh' '' @({literal(wrong)}, {literal(right)}) 'arm64'
 if ($path -ne {literal(right)}) {{ throw 'Did not select compatible candidate' }}
+""",
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="Exercises Windows file access failures"
+)
+@pytest.mark.parametrize("failure", ["locked", "missing", "access-denied"])
+@pytest.mark.parametrize("has_alternative", [True, False])
+def test_find_tool_skips_unreadable_executables(tmp_path, failure, has_alternative):
+    unreadable = tmp_path / "WindowsApps" / "python.exe"
+    alternative = tmp_path / "installed" / "python.exe"
+    if failure == "locked":
+        pe_file(unreadable, "arm64")
+    elif failure == "access-denied":
+        unreadable.mkdir(parents=True)
+    pe_file(alternative, "arm64")
+    result = run_ps(
+        tmp_path,
+        f"""
+Set-StrictMode -Version Latest
+. {literal(FIND_TOOLS)}
+function Get-ToolCandidates {{
+    # Simulate enumeration before the file became inaccessible/disappeared.
+    return @({literal(unreadable)}{", " + literal(alternative) if has_alternative else ""})
+}}
+function Invoke-ToolProbe {{
+    param($File, $Arguments)
+    if ($File -eq {literal(unreadable)}) {{ throw 'Must not execute an unreadable alias' }}
+    return '3.13.16 win-arm64'
+}}
+$lock = $null
+try {{
+    if ('{failure}' -eq 'locked') {{
+        $lock = [IO.File]::Open({literal(unreadable)}, 'Open', 'ReadWrite', 'None')
+    }}
+    $path = Find-Tool 'python' 'python.exe' @() 'arm64'
+    if ([bool]$path -ne ${str(has_alternative).lower()}) {{ throw 'Incorrect discovery result' }}
+    if ($path -and $path -ne {literal(alternative)}) {{ throw 'Did not select the readable candidate' }}
+}} finally {{
+    if ($lock) {{ $lock.Dispose() }}
+}}
+""",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "Ignoring unreadable executable" in result.stdout
+    assert str(unreadable) in result.stdout
+
+
+def test_pe_reader_releases_file_handle(tmp_path):
+    executable = tmp_path / "python.exe"
+    pe_file(executable, "arm64")
+    result = run_ps(
+        tmp_path,
+        f"""
+. {literal(FIND_TOOLS)}
+if ((Get-PeArchitecture {literal(executable)}) -ne 'arm64') {{ throw 'Wrong architecture' }}
+$exclusive = [IO.File]::Open({literal(executable)}, 'Open', 'ReadWrite', 'None')
+$exclusive.Dispose()
 """,
     )
     assert result.returncode == 0, result.stderr
@@ -350,7 +411,7 @@ function Expand-Archive {{
 }}
 function Invoke-ToolchainInstaller {{
     param($File, $Arguments)
-    if ($File -like '*python.exe' -and '{missing}' -eq 'python') {{
+    if ($File -like '*python-*.exe' -and '{missing}' -eq 'python') {{
         $script:available.python = $true
         $destination = ($Arguments | Where-Object {{ $_ -like 'TargetDir=*' }}).Substring(10)
         Touch-File (Join-Path $destination 'python.exe')

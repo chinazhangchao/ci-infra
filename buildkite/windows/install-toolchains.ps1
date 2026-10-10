@@ -253,7 +253,7 @@ function Install-WindowsToolchains {
         [string]$Target,
         [string]$Root,
         [string]$RequestedCudaPath,
-        [string]$PythonVersion = "3.12.10",
+        [string]$PythonVersion = "3.13.16",
         [hashtable]$ExistingTools = @{}
     )
     Assert-ToolchainInstallerHost $Target
@@ -349,14 +349,15 @@ function Install-WindowsToolchains {
     if ($isArm) {
         Write-Host "Perl and protoc may use x64 emulation; compilers and Python target native ARM64."
     }
+    $pythonMinor = ([version]$PythonVersion).ToString(2)
+    $pythonHome = Join-Path $Root "python-$pythonMinor"
     $pythonExe = Find-Tool "python" "python.exe" @($previous["PythonExecutable"],
-        (Join-Path $Root "python\python.exe")) $Target $PythonVersion
+        (Join-Path $pythonHome "python.exe"), (Join-Path $Root "python\python.exe")) $Target $PythonVersion
     if (-not $pythonExe) { $pythonExe = Get-MachinePython $Target $PythonVersion }
     if (-not $pythonExe) {
         $pythonInstaller = Get-ToolchainPayload `
             "https://www.python.org/ftp/python/$PythonVersion/python-$PythonVersion-$pythonArch.exe" `
-            (Join-Path $downloads "python.exe") -Publisher "Python Software Foundation"
-        $pythonHome = Join-Path $Root "python"
+            (Join-Path $downloads "python-$PythonVersion-$pythonArch.exe") -Publisher "Python Software Foundation"
         Invoke-ToolchainInstaller $pythonInstaller @(
             "/quiet", "InstallAllUsers=1", "TargetDir=$pythonHome", "PrependPath=0",
             "Include_launcher=0", "Include_test=0", "Include_pip=1"

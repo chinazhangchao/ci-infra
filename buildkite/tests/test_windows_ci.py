@@ -21,11 +21,11 @@ SOURCE = {"repository": ci.REPOSITORY, "branch": ci.DEFAULT_BRANCH, "commit": SH
 
 def make_wheel(directory, architecture="x64", *, tag=None, extension=True):
     platform = ci.PLATFORMS[architecture]
-    wheel = directory / f"vllm-0.29.0-cp312-cp312-{platform}.whl"
+    wheel = directory / f"vllm-0.29.0-cp313-cp313-{platform}.whl"
     with zipfile.ZipFile(wheel, "w") as archive:
         archive.writestr(
             "vllm-0.29.0.dist-info/WHEEL",
-            f"Wheel-Version: 1.0\nTag: {tag or f'cp312-cp312-{platform}'}\n",
+            f"Wheel-Version: 1.0\nTag: {tag or f'cp313-cp313-{platform}'}\n",
         )
         if extension:
             archive.writestr("vllm/_C.pyd", b"test extension")
@@ -231,7 +231,7 @@ def test_invalid_wheel_outputs_fail(tmp_path, problem):
         wheel = make_wheel(tmp_path)
         shutil.copyfile(wheel, tmp_path / "old-win_amd64.whl")
     elif problem == "wrong-tag":
-        make_wheel(tmp_path, tag="cp312-cp312-win_arm64")
+        make_wheel(tmp_path, tag="cp313-cp313-win_arm64")
     elif problem == "no-extension":
         make_wheel(tmp_path, extension=False)
     with pytest.raises(ValueError):

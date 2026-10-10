@@ -32,7 +32,7 @@ or saves an agent token.
 |------|----------------------|----------------------------------------------|
 | PowerShell | Native architecture, version 7.2+ | Native PowerShell 7.4.13 (portable) |
 | Git | Native architecture, version 2.35+ | Native MinGit 2.51.0 (portable) |
-| Python | Native architecture, requested major/minor, patch version at least `-PythonVersion`, with venv/ensurepip | Python 3.12.10 by default; configurable with `-PythonVersion` |
+| Python | Native architecture, requested major/minor, patch version at least `-PythonVersion`, with venv/ensurepip | Python 3.13.16 by default; configurable with `-PythonVersion` |
 | MSVC | Target compiler, linker, headers and libraries: x64 14.44; ARM64 14.51 for CUDA and 14.44 for Rust/OpenSSL | Only missing compiler components, using VS 2022 or VS 2026 18.6.3 |
 | Windows SDK | SDK 10.0.26100.0 headers, target libraries and resource compiler | Only the missing SDK component |
 | CUDA | x64 13.0 / ARM64 13.4, `nvcc`, `ptxas`, header and all required target libraries | NVIDIA's public CUDA 13.0 installer for x64; CUDA 13.4.2 installer for ARM64 |
@@ -46,6 +46,10 @@ Python also uses machine registration, CUDA checks its registration/environment,
 and Visual Studio uses `vswhere` to find installed editions. MSVC compiler
 families can be reused from **different** Visual Studio installations. The log
 identifies reused tools and rejected incompatible candidates.
+Unreadable executables, including Windows App Execution Aliases such as
+`AppData\Local\Microsoft\WindowsApps\python.exe`, are warned about and skipped.
+Discovery continues to another compatible installation or installs the missing
+tool; you do not need to disable the aliases.
 
 No download or installer is run for a compatible tool. An older, wrong-architecture
 or incomplete installation does not qualify; the script installs a compatible
@@ -66,6 +70,11 @@ from [requirements-toolchain.txt](requirements-toolchain.txt), plus your
 runtime dependency manifest/private wheels, into an isolated venv. It verifies
 native Python, PyTorch and actual GPU execution, installs the native Buildkite
 agent with checksum verification, and generates a launcher.
+Both Windows architectures default to **Python 3.13**. The pool creates
+`<InstallRoot>\venv` using the selected interpreter, without system-site
+packages, and checks that it is a real venv with the expected Python version
+and architecture **before** installing dependencies. Builds and smoke tests use
+that venv's `Scripts\python.exe`; you do not need to activate it manually.
 
 Create two self-hosted Buildkite queues, defaulting to `windows-x64` and
 `windows-arm64`. Give this pipeline access to those queues in your private
@@ -76,7 +85,7 @@ Both pools need:
 
 - Native Windows and an NVIDIA GPU/driver supported by their CUDA toolkit.
   ARM64 means native Windows ARM64, not an x64 Python running under emulation.
-- Buildkite agent, Git, Python 3.10+ (`python` on `PATH`), and PowerShell 7
+- Buildkite agent, Git, Python 3.13 (`python` on `PATH`), and PowerShell 7
   (`pwsh` on `PATH`). Configure the agent's command shell as
   `pwsh.exe -NoLogo -NoProfile -NonInteractive -Command`.
 - A provisioned, architecture-matched Python environment containing CUDA
@@ -214,6 +223,15 @@ and Administrators. `-ToolchainConfig` supplies all installed executable,
 compiler and include paths, including Perl and Protobuf; no manual PATH
 changes are needed.
 
+After switching from the earlier Python 3.12 setup, rerun `-InstallToolchains`
+with the same `ToolchainRoot` to refresh `toolchains.json`. New Python installs
+use a minor-version-specific directory (for example, `python-3.13`) and a
+version/architecture-specific installer cache, leaving the old Python 3.12
+directory and download untouched. An old 3.12 configuration is rejected by
+pool preparation instead of silently creating a 3.12 venv. If an `InstallRoot`
+already contains a previous pool/venv, choose a new root rather than replacing
+its Python in place.
+
 Prepare a requirements file for each architecture containing **runtime
 dependencies**, including the matching CUDA PyTorch wheel. Prefer a
 tested, version-pinned manifest and prebuilt dependency wheels. Do not include
@@ -222,6 +240,9 @@ starting point; its CUDA Torch pins need the matching PyTorch index or your
 wheelhouse. For ARM64, provide your private CUDA 13.4 Torch wheel and other
 ARM64 dependencies through `-Wheelhouse` or explicit references in the manifest.
 The script cannot manufacture these private packages.
+Use **Python 3.13-compatible wheels** (`cp313`, or an applicable `abi3`/pure
+Python wheel) for the matching Windows architecture, including your ARM64 CUDA
+PyTorch wheel. Python 3.12-only (`cp312`) wheels cannot be installed into this venv.
 
 The script installs `build`, CMake, Ninja, setuptools, setuptools-scm,
 setuptools-rust, wheel, packaging, Jinja2, regex, and the Python protobuf package
