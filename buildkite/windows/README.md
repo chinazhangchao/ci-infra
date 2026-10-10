@@ -22,13 +22,50 @@ or an end-to-end model inference test.
 
 ## Provision the private pools
 
-For machines with the toolchains already installed, use
-[`provision-pool.ps1`](provision-pool.ps1). It prepares a **new** pool directory,
-creates an isolated venv, installs your dependency manifest, verifies native
-Python/PyTorch and an actual CUDA operation, installs the native Buildkite agent
-from a pinned release after checking its published SHA-256 checksum, and
-generates a launcher. It does not install CUDA/Visual Studio, change machine-wide
-PATH, enable long paths, create a Windows service, start an agent, or save tokens.
+[`provision-pool.ps1`](provision-pool.ps1) supports the entire setup in two stages:
+**install only missing compatible machine tools as Administrator**, then **prepare the pool as
+an unprivileged agent account**. This separation keeps CI jobs from inheriting
+administrator privileges. Neither stage starts an agent, creates a service,
+or saves an agent token.
+
+| Tool | Reused when detected | Installed only if no compatible tool is found |
+|------|----------------------|----------------------------------------------|
+| PowerShell | Native architecture, version 7.2+ | Native PowerShell 7.4.13 (portable) |
+| Git | Native architecture, version 2.35+ | Native MinGit 2.51.0 (portable) |
+| Python | Native architecture, requested major/minor, patch version at least `-PythonVersion`, with venv/ensurepip | Python 3.12.10 by default; configurable with `-PythonVersion` |
+| MSVC | Target compiler, linker, headers and libraries: x64 14.44; ARM64 14.51 for CUDA and 14.44 for Rust/OpenSSL | Only missing compiler components, using VS 2022 or VS 2026 18.6.3 |
+| Windows SDK | SDK 10.0.26100.0 headers, target libraries and resource compiler | Only the missing SDK component |
+| CUDA | x64 13.0 / ARM64 13.4, `nvcc`, `ptxas`, header and all required target libraries | Public CUDA 13.0 for x64; **your supplied private CUDA 13.4 installer** for ARM64 |
+| Rust / Cargo | Native MSVC host, Rust and Cargo 1.95+, complete pair resolved from the actual toolchain rather than a user-specific rustup proxy | Native Rust/Cargo 1.95.0 |
+| Perl | Working Perl with `Locale::Maketext::Simple` and `IPC::Cmd` | Full Strawberry Perl 5.42.3.1 portable distribution |
+| `protoc` | Version 29+, working compiler and standard `google\protobuf\struct.proto` include tree | Protobuf compiler 33.0 and standard includes |
+
+Discovery checks explicit tool paths, paths recorded by a previous successful
+run, the managed toolchain directory, PATH and standard installation locations.
+Python also uses machine registration, CUDA checks its registration/environment,
+and Visual Studio uses `vswhere` to find installed editions. MSVC compiler
+families can be reused from **different** Visual Studio installations. The log
+identifies reused tools and rejected incompatible candidates.
+
+No download or installer is run for a compatible tool. An older, wrong-architecture
+or incomplete installation does not qualify; the script installs a compatible
+copy without uninstalling the existing one. For tools in nonstandard locations,
+pass the existing executable/path parameters with `-InstallToolchains`, such as
+`-PerlPath`, `-ProtocPath`, `-ProtocIncludePath`, `-RustcExecutable`,
+`-VisualStudioPath`, or `-RustVisualStudioPath`. Reused paths must be accessible
+to the unprivileged agent account, not only the administrator.
+
+The downloaded Perl and `protoc` packages are x64 **host utilities**, including
+on ARM64 where Windows x64 emulation is required; existing compatible native
+ARM64 tools are also accepted. Python, Rust, Git, PowerShell and the generated
+vLLM binaries use the native architecture. Strawberry's bundled MinGW compiler
+is not added to PATH: vLLM and OpenSSL use MSVC.
+
+The pool-preparation stage installs **CMake, Ninja and the Python build tools**
+from [requirements-toolchain.txt](requirements-toolchain.txt), plus your
+runtime dependency manifest/private wheels, into an isolated venv. It verifies
+native Python, PyTorch and actual GPU execution, installs the native Buildkite
+agent with checksum verification, and generates a launcher.
 
 Create two self-hosted Buildkite queues, defaulting to `windows-x64` and
 `windows-arm64`. Give this pipeline access to those queues in your private
@@ -54,12 +91,14 @@ Both pools need:
 - Windows long paths enabled by the pool administrator. Git long-path support
   is enabled only in each job's temporary source checkout.
 
-**x64:** Follow the fork's Windows README for the matching Torch/CUDA/compiler
+**x64:** The automated toolchain stage uses the fork's Windows README's Torch/CUDA/compiler
 combination (currently Torch `2.11.0+cu130` and CUDA 13). Provision from
 `requirements\build\cuda.txt`, `requirements\cuda.txt`, and
 `requirements\windows.txt`, resolving all native dependencies for x64. If the
-toolkit needs the fork's CUDA alignment fix, apply it while provisioning the
-image, not in an unprivileged CI job. The build uses `--no-isolation` and
+toolkit is selected with `-InstallToolchains`, the script also applies the
+fork's MSVC tensor-map alignment fix to CUDA 13.0's `include\cuda.h`, retaining
+the original as `cuda.h.original` in the toolchain root. It refuses unrecognized
+header layouts rather than silently patching them. The build uses `--no-isolation` and
 `--skip-dependency-check`, as the ARM64 helper does: the fork's generic
 `pyproject.toml` Torch pin differs from its Windows requirements.
 
@@ -108,15 +147,77 @@ Do not place the provisioned venv inside a Buildkite checkout.
 
 ### Run the provisioning script
 
-Run **native PowerShell 7** as the dedicated account that will run the agent.
-The account needs permission to create the requested installation directory,
-but the script does not require elevation. Windows long paths must already
-be enabled. The new directory's ACL permits only this account, SYSTEM, and
-Administrators. Do not provision as Administrator and then run CI as
-Administrator; provision under the intended unprivileged agent identity.
+#### 1. Install missing machine toolchains (Administrator)
 
-Prepare a requirements file for each architecture containing **all build and
-runtime dependencies**, including the matching CUDA PyTorch wheel. Prefer a
+Start an **elevated Windows PowerShell 5.1 or PowerShell 7** terminal. No
+preinstalled Git, Python, Perl, Protobuf, PowerShell 7, or package manager is
+required; download/extract this repository first if Git is not installed.
+
+For **x64**:
+
+```powershell
+.\buildkite\windows\provision-pool.ps1 `
+    -Architecture x64 -InstallToolchains `
+    -ToolchainRoot 'C:\vllm-tools\x64'
+```
+
+For **ARM64**:
+
+```powershell
+.\buildkite\windows\provision-pool.ps1 `
+    -Architecture arm64 -InstallToolchains `
+    -ToolchainRoot 'C:\vllm-tools\arm64' `
+    -CudaInstallerPath 'C:\pool-inputs\cuda-13.4-windows-arm64.exe' `
+    -CudaInstallerSha256 '<SHA-256 supplied by your CUDA package provider>'
+```
+
+**Omit `-CudaInstallerPath` and `-CudaInstallerSha256` if compatible ARM64 CUDA
+13.4 is already installed.** They are required only when CUDA is missing or
+incomplete; an unused installer path is not read or validated.
+
+When needed, the ARM64 installer must be your Windows ARM64 CUDA 13.4 package, supporting
+NVIDIA's `-s -n` unattended/no-automatic-reboot options. It must install the
+required ARM64 libraries and a compatible NVIDIA GPU driver (or the driver
+must already be present). There is no assumed public download for this private
+toolkit. Supply its **trusted SHA-256**, not an unchecked download URL.
+The default expected CUDA destination is
+`C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4`; use `-CudaPath`
+if your private installer uses another directory. This specifies where to
+verify the install, not an installer destination override.
+
+Both architectures receive missing Perl and `protoc` automatically; no `-PerlPath`
+or `-ProtocPath` is needed for standard/PATH installations. Public archive downloads have pinned
+SHA-256 checksums. Python, Visual Studio and the public CUDA executable are
+checked for valid vendor signatures before execution. Rustup verifies the Rust
+toolchain downloads. Download cache entries are reverified before use; a
+checksum/signature mismatch stops with the cached file path so you can remove
+that specific bad download and retry.
+Visual Studio component IDs and installed compiler
+families are checked; ARM64 does not silently substitute a newer compiler
+family for the fork's required 14.51/14.44 combination. Installed servicing
+versions are recorded and passed to the fork helper.
+
+This stage installs missing machine software and enables Windows long paths
+only when needed. It does not run the CUDA installer or change drivers when a
+complete matching CUDA toolkit is present; GPU/driver functionality is checked
+in pool preparation. When CUDA installation is needed it can install/update
+the NVIDIA driver. Vendor installers may update their own
+registry/PATH settings. It never reboots automatically: exit code **3010**
+means **reboot before the next stage**. Installation can take substantial time,
+disk space and network bandwidth. The toolchain directory is writable only by
+Administrators/SYSTEM and readable/executable by local users. Do not run this
+on an active CI worker; drain it first.
+
+#### 2. Prepare the pool (dedicated unprivileged agent account)
+
+Use the installed native PowerShell to prepare a new pool. This stage does not
+require elevation. Its directory ACL permits only the agent account, SYSTEM,
+and Administrators. `-ToolchainConfig` supplies all installed executable,
+compiler and include paths, including Perl and Protobuf; no manual PATH
+changes are needed.
+
+Prepare a requirements file for each architecture containing **runtime
+dependencies**, including the matching CUDA PyTorch wheel. Prefer a
 tested, version-pinned manifest and prebuilt dependency wheels. Do not include
 vLLM itself. For x64, the fork's three requirements files listed above are the
 starting point; its CUDA Torch pins need the matching PyTorch index or your
@@ -124,58 +225,57 @@ wheelhouse. For ARM64, provide your private CUDA 13.4 Torch wheel and other
 ARM64 dependencies through `-Wheelhouse` or explicit references in the manifest.
 The script cannot manufacture these private packages.
 
-The manifest must include `build`, `pip`, CMake, Ninja, setuptools,
-setuptools-scm, setuptools-rust, wheel, packaging, Jinja2, regex, and protobuf,
-as well as the runtime dependencies. Index settings, if needed, go in that
+The script installs `build`, CMake, Ninja, setuptools, setuptools-scm,
+setuptools-rust, wheel, packaging, Jinja2, regex, and the Python protobuf package
+from its own build-requirements file. Your manifest can further constrain those
+versions. With `-NoIndex`, your wheelhouse must contain **both** build and runtime
+dependency wheels. Index settings, if needed, go in your
 trusted manifest: pip runs with `--isolated`, ignoring user pip configuration
 and `PIP_*` environment variables. `-NoIndex` disables package-index lookup;
 direct URL references in a manifest are still honored by pip. For disconnected
 dependency installation, use only local references and a complete wheelhouse.
 The agent release download still needs access to GitHub.
 
-Example **x64** invocation (replace tool paths and dependency inputs):
+Example **x64** invocation:
 
 ```powershell
-.\buildkite\windows\provision-pool.ps1 `
+$tools = Get-Content 'C:\vllm-tools\x64\toolchains.json' -Raw | ConvertFrom-Json
+& $tools.parameters.PwshExecutable -NoProfile `
+    -File .\buildkite\windows\provision-pool.ps1 `
     -Architecture x64 `
-    -PythonExecutable 'C:\Python312\python.exe' `
-    -CudaPath 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0' `
-    -VisualStudioPath 'C:\Program Files\Microsoft Visual Studio\2022\BuildTools' `
+    -ToolchainConfig 'C:\vllm-tools\x64\toolchains.json' `
     -RequirementsFile 'C:\pool-inputs\requirements-x64.txt' `
     -Wheelhouse 'C:\pool-inputs\wheels-x64' -NoIndex `
     -CudaArchList '8.9' `
-    -ProtocPath 'C:\tools\protobuf\bin\protoc.exe' `
-    -ProtocIncludePath 'C:\tools\protobuf\include' `
-    -PerlPath 'C:\Strawberry\perl\bin\perl.exe' `
     -InstallRoot 'C:\bk\x64'
 ```
 
 Example **ARM64** invocation:
 
 ```powershell
-.\buildkite\windows\provision-pool.ps1 `
+$tools = Get-Content 'C:\vllm-tools\arm64\toolchains.json' -Raw | ConvertFrom-Json
+& $tools.parameters.PwshExecutable -NoProfile `
+    -File .\buildkite\windows\provision-pool.ps1 `
     -Architecture arm64 `
-    -PythonExecutable 'C:\Python312-arm64\python.exe' `
-    -CudaPath 'C:\CUDA\v13.4' `
-    -VisualStudioPath 'C:\Program Files\Microsoft Visual Studio\18\BuildTools' `
-    -RustVisualStudioPath 'C:\Program Files\Microsoft Visual Studio\2022\BuildTools' `
+    -ToolchainConfig 'C:\vllm-tools\arm64\toolchains.json' `
     -RequirementsFile 'C:\pool-inputs\requirements-arm64.txt' `
     -Wheelhouse 'C:\pool-inputs\wheels-arm64' -NoIndex `
     -CudaArchList '12.0+PTX;10.3a' `
     -CMakeCudaArchitectures '120-real;103-real' `
-    -ProtocPath 'C:\tools\protobuf\bin\protoc.exe' `
-    -ProtocIncludePath 'C:\tools\protobuf\include' `
-    -PerlPath 'C:\tools\perl\bin\perl.exe' `
     -InstallRoot 'C:\bk\arm64'
 ```
 
-Git, Cargo and Rust must already be on this account's PATH. Rust must be 1.95+
-and use the native MSVC host target. `VisualStudioPath` and
-`RustVisualStudioPath` may also point directly to `vcvarsall.bat`.
-Use `-Queue` for a custom queue and `-MaxJobs` to tune compilation concurrency.
-The ARM64 toolset/SDK defaults match the fork helper; override
-`-MsvcToolsetVersion`, `-RustMsvcToolsetVersion`, or `-WindowsSdkVersion` if
-your tested configuration differs. Buildkite defaults to release `4.3.0`;
+For already provisioned toolchains, the original explicit
+`-PythonExecutable`, `-CudaPath`, `-VisualStudioPath`, `-PerlPath`, `-ProtocPath`,
+and `-ProtocIncludePath` parameters remain supported **instead of**
+`-ToolchainConfig`. In this reuse mode, Git and Rust must be on PATH or specified
+with `-GitExecutable`, `-CargoExecutable`, and `-RustcExecutable`; PowerShell
+must already be native 7.2+. The ARM64 compiler/SDK overrides remain available.
+Do not combine manual tool paths with `-ToolchainConfig`: its recorded values
+are authoritative.
+
+Use `-Queue` for a custom queue and `-MaxJobs` for compilation concurrency.
+Buildkite defaults to release `4.3.0`;
 `-AgentVersion` selects another explicit stable release, never a moving `latest`.
 
 On success, the root contains `venv`, `bin\buildkite-agent.exe`,
@@ -200,11 +300,22 @@ The script deliberately does not create a LocalSystem service or persist a
 token in generated files. Confirm the agent appears in the intended Buildkite
 queue after starting it.
 
-Provisioning never overwrites an existing root or edits a running pool. For an
-upgrade, use a new root, then switch the agent launcher after draining the old
-agent. A failure leaves its partial directory for diagnosis and does not write
-the `provisioning.json` completion marker; the launcher refuses incomplete
-installations. A successful provision establishes dependency/tool availability,
+Rerun `-InstallToolchains` with the **same ToolchainRoot** to reuse validated
+tools and finish missing components after a partial run. A managed root has
+`.vllm-toolchains.json` (or a `toolchains.json` produced by the earlier script);
+unrelated directories and roots for a different architecture are rejected.
+Incomplete managed portable copies can be repaired, but valid ones are not
+re-extracted. Existing system Visual Studio instances are inspected, not modified;
+missing components are added to the script's managed VS instance. Reboot requests
+are remembered across retries until the machine has rebooted.
+
+Pool preparation still requires a **new InstallRoot**, preserving environment
+isolation and avoiding changes to live agents. Machine installers can service
+existing machine-level products when a compatible installation is absent.
+A failed rerun preserves the last successful `toolchains.json`; a first failed
+run writes no completion configuration. Pool failures write no
+`provisioning.json`, and the launcher refuses incomplete pools.
+A successful provision establishes dependency/tool availability,
 not a successful vLLM compilation; run the Windows pipeline to establish that.
 
 ## Create and run the Buildkite pipeline
@@ -254,7 +365,7 @@ test; only consume artifacts from a successful job.
 Run infrastructure tests (no CUDA needed):
 
 ```powershell
-python -m pytest buildkite\tests\test_windows_ci.py buildkite\tests\test_windows_provisioning.py
+python -m pytest buildkite\tests\test_windows_ci.py buildkite\tests\test_windows_provisioning.py buildkite\tests\test_windows_tool_discovery.py
 ```
 
 Native `.cmd` exit-code tests run on Windows and are skipped on other hosts.
