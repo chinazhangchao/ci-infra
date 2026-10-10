@@ -1,12 +1,22 @@
-#requires -Version 7.2
+#requires -Version 5.1
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][ValidateSet("x64", "arm64")][string]$Architecture,
-    [Parameter(Mandatory)][string]$PythonExecutable,
-    [Parameter(Mandatory)][string]$CudaPath,
-    [Parameter(Mandatory)][string]$VisualStudioPath,
-    [Parameter(Mandatory)][string]$RequirementsFile,
-    [Parameter(Mandatory)][string]$CudaArchList,
+    [switch]$InstallToolchains,
+    [string]$ToolchainRoot = "",
+    [string]$ToolchainConfig = "",
+    [string]$CudaInstallerPath = "",
+    [string]$CudaInstallerSha256 = "",
+    [ValidatePattern('^3\.(10|11|12|13|14)\.\d+$')][string]$PythonVersion = "3.12.10",
+    [string]$PythonExecutable = "",
+    [string]$CudaPath = "",
+    [string]$VisualStudioPath = "",
+    [string]$RequirementsFile = "",
+    [string]$CudaArchList = "",
+    [string]$GitExecutable = "git.exe",
+    [string]$PwshExecutable = "",
+    [string]$CargoExecutable = "cargo.exe",
+    [string]$RustcExecutable = "rustc.exe",
     [string]$InstallRoot = "",
     [string]$Wheelhouse = "",
     [switch]$NoIndex,
@@ -25,6 +35,26 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+
+function Import-ToolchainConfig {
+    param([string]$Path, [string]$Target)
+    $config = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    if ($config.architecture -ne $Target) {
+        throw "ToolchainConfig does not target $Target."
+    }
+    $allowed = @(
+        "PythonExecutable", "CudaPath", "VisualStudioPath", "RustVisualStudioPath",
+        "MsvcToolsetVersion", "RustMsvcToolsetVersion", "WindowsSdkVersion",
+        "GitExecutable", "PwshExecutable", "CargoExecutable", "RustcExecutable",
+        "PerlPath", "ProtocPath", "ProtocIncludePath"
+    )
+    foreach ($entry in $config.parameters.PSObject.Properties) {
+        if ($entry.Name -notin $allowed -or $entry.Value -isnot [string]) {
+            throw "Unsupported toolchain configuration field: $($entry.Name)"
+        }
+        Set-Variable -Name $entry.Name -Value $entry.Value -Scope Script
+    }
+}
 
 function Invoke-CheckedCommand {
     param([string]$File, [string[]]$Arguments, [switch]$Capture)
@@ -147,6 +177,16 @@ function Install-PoolAgent {
 }
 
 function Invoke-PoolProvisioning {
+    if ($PSVersionTable.PSVersion -lt [version]"7.2") {
+        throw "Use PowerShell 7.2+ for pool preparation. Windows PowerShell 5.1 supports -InstallToolchains only."
+    }
+    if ($ToolchainConfig) {
+        Import-ToolchainConfig $ToolchainConfig $Architecture
+    }
+    if (-not $RequirementsFile -or -not $CudaArchList -or -not $PythonExecutable -or
+        -not $CudaPath -or -not $VisualStudioPath) {
+        throw "Pool preparation requires RequirementsFile, CudaArchList and either ToolchainConfig or the Python/CUDA/Visual Studio paths."
+    }
     Assert-NativeHost $Architecture
     if ($InstallRoot -and -not [IO.Path]::IsPathFullyQualified($InstallRoot)) {
         throw "InstallRoot must be an absolute path outside any source checkout."
@@ -211,10 +251,10 @@ function Invoke-PoolProvisioning {
             [void](Resolve-RequiredPath (Join-Path $sdk $directory) Container)
         }
     }
-    $git = Resolve-Tool "git.exe"
-    $pwsh = Join-Path $PSHOME "pwsh.exe"
-    $cargo = Resolve-Tool "cargo.exe"
-    $rustc = Resolve-Tool "rustc.exe"
+    $git = Resolve-Tool $GitExecutable
+    $pwsh = if ($PwshExecutable) { Resolve-Tool $PwshExecutable } else { Join-Path $PSHOME "pwsh.exe" }
+    $cargo = Resolve-Tool $CargoExecutable
+    $rustc = Resolve-Tool $RustcExecutable
     $rust = Invoke-CheckedCommand $rustc @("-vV") -Capture
     $rustHost = if ($Architecture -eq "arm64") {
         "aarch64-pc-windows-msvc"
@@ -246,18 +286,38 @@ function Invoke-PoolProvisioning {
     $venv = Join-Path $root "venv"
     Invoke-CheckedCommand $python @("-I", "-m", "venv", $venv)
     $venvPython = Join-Path $venv "Scripts\python.exe"
-    $pipArguments = @("-I", "-m", "pip", "--isolated", "--disable-pip-version-check", "install", "-r", $requirements)
+    $buildRequirements = Join-Path $PSScriptRoot "requirements-toolchain.txt"
+    $pipArguments = @(
+        "-I", "-m", "pip", "--isolated", "--disable-pip-version-check", "install",
+        "-r", $buildRequirements, "-r", $requirements
+    )
     if ($wheels) { $pipArguments += @("--find-links", $wheels) }
     if ($NoIndex) { $pipArguments += "--no-index" }
-    Write-Host "Installing the pool's dependency manifest into $venv"
-    Invoke-CheckedCommand $venvPython $pipArguments
-    Invoke-CheckedCommand $venvPython @("-I", "-m", "pip", "--isolated", "check")
-    foreach ($tool in @("cmake.exe", "ninja.exe")) {
-        [void](Resolve-RequiredPath (Join-Path $venv "Scripts\$tool") Leaf)
+    $paths = @(
+        (Join-Path $root "bin"), (Join-Path $venv "Scripts"), (Join-Path $cuda "bin"),
+        (Split-Path -Parent $git), (Split-Path -Parent $pwsh),
+        (Split-Path -Parent $cargo), (Split-Path -Parent $rustc),
+        (Split-Path -Parent $perl), (Split-Path -Parent $protoc)
+    ) | Select-Object -Unique
+    $dependencyEnvironment = @{
+        CUDA_PATH = $cuda; CUDA_HOME = $cuda; CUDA_ROOT = $cuda
+        PROTOC = $protoc; PROTOC_INCLUDE = $protoInclude
+        CARGO_HOME = (Join-Path $root "cargo-cache")
     }
+    $originalEnvironment = @{}
     $originalPath = $env:PATH
     try {
-        $env:PATH = (Join-Path $cuda "bin") + [IO.Path]::PathSeparator + $env:PATH
+        $env:PATH = (@($paths) + @($originalPath)) -join [IO.Path]::PathSeparator
+        foreach ($entry in $dependencyEnvironment.GetEnumerator()) {
+            $originalEnvironment[$entry.Key] = [Environment]::GetEnvironmentVariable($entry.Key, "Process")
+            [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
+        }
+        Write-Host "Installing the pool's dependency manifest into $venv"
+        Invoke-CheckedCommand $venvPython $pipArguments
+        Invoke-CheckedCommand $venvPython @("-I", "-m", "pip", "--isolated", "check")
+        foreach ($tool in @("cmake.exe", "ninja.exe")) {
+            [void](Resolve-RequiredPath (Join-Path $venv "Scripts\$tool") Leaf)
+        }
         $runtime = Invoke-CheckedCommand $venvPython @("-I", "-c", @'
 import json, sysconfig
 import build, setuptools, setuptools_scm, setuptools_rust, wheel, packaging, jinja2, regex
@@ -272,6 +332,9 @@ print(json.dumps(dict(platform=sysconfig.get_platform(), torch=torch.__version__
 '@) -Capture | ConvertFrom-Json
     } finally {
         $env:PATH = $originalPath
+        foreach ($entry in $originalEnvironment.GetEnumerator()) {
+            [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
+        }
     }
     if ($runtime.platform -cne $platform -or $runtime.cuda -ne $cudaVersion) {
         throw "Installed PyTorch must target $platform and CUDA $cudaVersion."
@@ -289,6 +352,7 @@ print(json.dumps(dict(platform=sysconfig.get_platform(), torch=torch.__version__
         BUILDKITE_BUILD_PATH = (Join-Path $root "checkouts")
         PROTOC = $protoc
         PROTOC_INCLUDE = $protoInclude
+        CARGO_HOME = (Join-Path $root "cargo-cache")
     }
     if ($Architecture -eq "x64") {
         $settings.VLLM_WINDOWS_VCVARSALL = $vcvars
@@ -303,12 +367,6 @@ print(json.dumps(dict(platform=sysconfig.get_platform(), torch=torch.__version__
         $settings.VLLM_WINDOWS_PROTOC_PATH = $protoc
         $settings.VLLM_WINDOWS_PROTOC_INCLUDE_PATH = $protoInclude
     }
-    $paths = @(
-        (Join-Path $root "bin"), (Join-Path $venv "Scripts"), (Join-Path $cuda "bin"),
-        (Split-Path -Parent $git), (Split-Path -Parent $pwsh),
-        (Split-Path -Parent $cargo), (Split-Path -Parent $rustc),
-        (Split-Path -Parent $perl), (Split-Path -Parent $protoc)
-    ) | Select-Object -Unique
     $configuration = [ordered]@{ environment = $settings; paths = @($paths) }
     $configuration | ConvertTo-Json -Depth 5 |
         Set-Content -LiteralPath (Join-Path $root "environment.json") -Encoding utf8
@@ -337,5 +395,17 @@ git-clean-flags="-ffdx"
 }
 
 if ($MyInvocation.InvocationName -ne ".") {
-    Invoke-PoolProvisioning
+    if ($InstallToolchains) {
+        if ($ToolchainConfig) { throw "Use InstallToolchains and ToolchainConfig in separate invocations." }
+        . (Join-Path $PSScriptRoot "install-toolchains.ps1")
+        $toolsRoot = if ($ToolchainRoot) { $ToolchainRoot } else { "C:\vllm-tools\$Architecture" }
+        $existing = @{}
+        foreach ($name in @("PythonExecutable", "GitExecutable", "PwshExecutable", "RustcExecutable",
+            "PerlPath", "ProtocPath", "ProtocIncludePath", "VisualStudioPath", "RustVisualStudioPath")) {
+            if ($PSBoundParameters.ContainsKey($name)) { $existing[$name] = $PSBoundParameters[$name] }
+        }
+        exit (Install-WindowsToolchains $Architecture $toolsRoot $CudaInstallerPath $CudaInstallerSha256 $CudaPath $PythonVersion $existing)
+    } else {
+        Invoke-PoolProvisioning
+    }
 }
