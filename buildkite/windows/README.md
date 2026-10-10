@@ -266,19 +266,29 @@ its Python in place.
 [`requirements-arm64.txt`](requirements-arm64.txt) and passes your wheelhouse
 to pip as `--find-links` for both build and runtime dependencies. Public indexes
 remain available unless you also specify `-NoIndex`; Torch is selected
-separately from NVIDIA. The manifest is based on the fork's
+separately from NVIDIA. Pool dependency installation uses
+`--only-binary=:all:` for both architectures, including transitive dependencies.
+It selects compatible wheels from the configured indexes and wheelhouse,
+ignores newer source-only releases, and reports an error when no wheel
+satisfies the version, Python and platform requirements. It does not fall back
+to compiling dependencies. The CI job still builds vLLM itself from source.
+The manifest is based on the fork's
 [`bd3dc3d` requirements](https://github.com/vortex-captain/vllm-windows/tree/bd3dc3d3364a50012bf70b7376010c1b2c89633c/requirements).
 It includes common runtime, server, tokenizer, structured-output, Windows event
 loop and Triton dependencies. Numba 0.68.0, NVTX 0.2.16, fastsafetensors 0.4.0,
 and triton-windows 3.8.0.post29 replace older fork pins to use releases with
-Python 3.13 Windows ARM64 wheels.
+Python 3.13 Windows ARM64 wheels. The ARM64 profile also pins
+`llguidance==1.8.0`, whose `cp39-abi3-win_arm64` wheel supports Python 3.13.
+This intentionally overrides the fork's `>=1.7.0,<1.8.0` constraint; the CUDA
+kernel smoke test does not cover structured-output backend compatibility.
 
 Some other dependencies (including tiktoken and outlines-core)
 do not currently publish matching ARM64 wheels. Supply compatible builds in
 your wheelhouse rather than relying on public package availability. Without
-a matching wheel, pip may attempt a source build, which can still fail if
-the package does not support Windows ARM64. Provisioning does not suppress
-such failures. OpenCV headless and the `mistral-common[image]` extra that pulls
+a matching wheel, provisioning stops with pip's missing-distribution or
+dependency-conflict error. A project being listed on PyPI does not mean it has
+a wheel for the pinned version and Windows ARM64.
+OpenCV headless and the `mistral-common[image]` extra that pulls
 it in are omitted from this CI profile; OpenCV-dependent image/video features
 require a separate optional installation. TileLang and
 InstantTensor are optional acceleration/model-loading backends with no public

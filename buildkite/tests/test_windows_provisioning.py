@@ -97,6 +97,8 @@ def test_arm64_runtime_manifest_parses_and_does_not_pin_torch():
     assert {"opencv-python", "opencv-python-headless"}.isdisjoint(names)
     mistral = next(req for req in requirements if req.name == "mistral-common")
     assert not mistral.extras
+    llguidance = next(req for req in requirements if req.name == "llguidance")
+    assert str(llguidance.specifier) == "==1.8.0"
     triton = next(req for req in requirements if req.name == "triton-windows")
     assert triton.specifier.contains("3.8.0.post29")
 
@@ -490,6 +492,7 @@ $script:commands | ConvertTo-Json -Depth 5 |
         if "install" in c["arguments"] and "--dry-run" not in c["arguments"]
     )
     assert "--isolated" in installation
+    assert "--only-binary=:all:" in installation
     assert str(WINDOWS / "requirements-toolchain.txt") in installation
     assert str(requirements) in installation
     assert ("--no-index" in installation) == no_index
@@ -594,6 +597,75 @@ try {
     assert not (pool / "torch-constraints.txt").exists()
 
 
+@pytest.mark.parametrize("has_wheel", [False, True])
+@pytest.mark.parametrize("transitive", [False, True])
+def test_pip_wheel_only_never_falls_back_to_newer_source(
+    tmp_path, has_wheel, transitive
+):
+    (tmp_path / "wheel_dependency-2.0.tar.gz").write_bytes(
+        b"Source archives must never be opened or built."
+    )
+    packages = []
+    if has_wheel:
+        packages.append(("wheel_dependency", "wheel-dependency", ""))
+    if transitive:
+        packages.append(
+            ("pool_fixture", "pool-fixture", "Requires-Dist: wheel-dependency>=1.0\n")
+        )
+    for distribution, name, dependencies in packages:
+        wheel = tmp_path / f"{distribution}-1.0-py3-none-any.whl"
+        metadata_dir = f"{distribution}-1.0.dist-info"
+        with zipfile.ZipFile(wheel, "w") as archive:
+            archive.writestr(
+                f"{metadata_dir}/METADATA",
+                f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n{dependencies}",
+            )
+            archive.writestr(
+                f"{metadata_dir}/WHEEL",
+                "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+            )
+            archive.writestr(f"{metadata_dir}/RECORD", "")
+    report = tmp_path / "resolution.json"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-m",
+            "pip",
+            "--isolated",
+            "--disable-pip-version-check",
+            "install",
+            "--only-binary=:all:",
+            "--dry-run",
+            "--ignore-installed",
+            "--no-index",
+            "--find-links",
+            str(tmp_path),
+            "--report",
+            str(report),
+            "pool-fixture" if transitive else "wheel-dependency>=1.0",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    output = result.stdout + result.stderr
+    assert "Building wheel" not in output
+    assert "Installing build dependencies" not in output
+    if has_wheel:
+        assert result.returncode == 0, result.stderr
+        selected = json.loads(report.read_text())["install"]
+        dependency = next(
+            item for item in selected if item["metadata"]["name"] == "wheel-dependency"
+        )
+        assert dependency["metadata"]["version"] == "1.0"
+        assert dependency["download_info"]["url"].endswith(".whl")
+    else:
+        assert result.returncode != 0
+        assert "No matching distribution found for wheel-dependency" in result.stderr
+        assert not report.exists()
+
+
 @pytest.mark.parametrize("conflicting_pin", [False, True])
 def test_pip_resolves_nightly_torch_url_constraint_without_downgrade(
     tmp_path, conflicting_pin
@@ -627,6 +699,7 @@ def test_pip_resolves_nightly_torch_url_constraint_without_downgrade(
             "--isolated",
             "--disable-pip-version-check",
             "install",
+            "--only-binary=:all:",
             "--dry-run",
             "--ignore-installed",
             "--no-index",

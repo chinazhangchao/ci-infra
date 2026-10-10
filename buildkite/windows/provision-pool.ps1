@@ -334,7 +334,7 @@ function Invoke-PoolProvisioning {
     $buildRequirements = Join-Path $PSScriptRoot "requirements-toolchain.txt"
     $pipArguments = @(
         "-I", "-m", "pip", "--isolated", "--disable-pip-version-check", "install",
-        "-r", $buildRequirements, "-r", $requirements
+        "--only-binary=:all:", "-r", $buildRequirements, "-r", $requirements
     )
     if ($wheels) { $pipArguments += @("--find-links", $wheels) }
     if ($NoIndex) { $pipArguments += "--no-index" }
@@ -366,7 +366,7 @@ function Invoke-PoolProvisioning {
             $torchSelection = Select-NvidiaTorch $venvPython $root
             $pipArguments += @("-c", $torchSelection.Constraints, "torch==$($torchSelection.Version)")
         }
-        Write-Host "Installing the pool's dependency manifest into $venv"
+        Write-Host "Installing the pool's dependency manifest into $venv (wheels only; missing compatible wheels are errors)"
         Invoke-CheckedCommand $venvPython $pipArguments
         Invoke-CheckedCommand $venvPython @("-I", "-m", "pip", "--isolated", "check")
         foreach ($tool in @("cmake.exe", "ninja.exe")) {
