@@ -453,6 +453,7 @@ function Install-WindowsToolchains {
         parameters = $parameters
     } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $configPath -Encoding UTF8
     Write-Host "Toolchains installed. Reboot if requested, then prepare the pool as an unprivileged account:"
-    Write-Host "& '$($parameters.PwshExecutable)' -NoProfile -File '$PSScriptRoot\provision-pool.ps1' -Architecture $Target -ToolchainConfig '$configPath' -RequirementsFile <runtime-requirements.txt> -CudaArchList <GPU-targets>"
+    $runtimeArgument = if ($isArm) { "" } else { " -RequirementsFile <runtime-requirements.txt>" }
+    Write-Host "& '$($parameters.PwshExecutable)' -NoProfile -File '$PSScriptRoot\provision-pool.ps1' -Architecture $Target -ToolchainConfig '$configPath'$runtimeArgument -CudaArchList <GPU-targets>"
     return $(if ($script:ToolchainRebootRequired) { 3010 } else { 0 })
 }

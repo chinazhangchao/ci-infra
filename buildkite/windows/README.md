@@ -67,7 +67,10 @@ is not added to PATH: vLLM and OpenSSL use MSVC.
 
 The pool-preparation stage installs **CMake, Ninja and the Python build tools**
 from [requirements-toolchain.txt](requirements-toolchain.txt), plus your
-runtime dependency manifest/private wheels, into an isolated venv. It verifies
+runtime dependencies into an isolated venv. ARM64 uses the checked-in
+[`requirements-arm64.txt`](requirements-arm64.txt) by default; you do not need
+to create a requirements file. Keep `-Wheelhouse` pointing to your existing
+Windows ARM64 wheel directory for packages unavailable from public indexes. It verifies
 native Python, PyTorch and actual GPU execution, installs the native Buildkite
 agent with checksum verification, and generates a launcher.
 For **ARM64**, it selects the latest compatible Torch wheel (including
@@ -119,9 +122,8 @@ header layouts rather than silently patching them. The build uses `--no-isolatio
 **arm64:** The helper on the selected branch requires **Windows ARM64 PyTorch
 built for CUDA 13.4** and the ARM64 CUDA toolkit/libraries. Provisioning selects
 Torch from NVIDIA's nightly index automatically; x64 wheels are not substitutes.
-Provision the remaining compatible ARM64 build and
-runtime dependencies from your own wheelhouse; do not blindly install the
-x64-only pins in the generic requirements. At the time of integration, the
+The default runtime manifest includes the fork's common requirements and
+Windows dependencies, without its x64-only packages. At the time of integration, the
 helper defaults to MSVC `14.51.36231` for CUDA, MSVC `14.44.35207` for
 Rust/OpenSSL, SDK `10.0.26100.0`, and Rust 1.95+. Its own prerequisite checks
 remain authoritative. It also needs environment-local CMake and Ninja.
@@ -238,15 +240,34 @@ pool preparation instead of silently creating a 3.12 venv. If an `InstallRoot`
 already contains a previous pool/venv, choose a new root rather than replacing
 its Python in place.
 
-Prepare a requirements file for each architecture containing **runtime
-dependencies**. For x64, include the matching CUDA PyTorch wheel as before.
-For ARM64, **omit legacy Torch version pins and wheel URLs**: the script selects
-Torch from NVIDIA's index automatically. Prefer a
-tested, version-pinned manifest and prebuilt dependency wheels. Do not include
-vLLM itself. For x64, the fork's three requirements files listed above are the
-starting point; its CUDA Torch pins need the matching PyTorch index or your
-wheelhouse. For ARM64, provide the remaining dependencies through `-Wheelhouse`
-or explicit references in the manifest.
+**Only `-RequirementsFile` can be omitted for the ARM64 default. Keep
+`-Wheelhouse` for your Windows ARM64 dependency wheels.** The script uses
+[`requirements-arm64.txt`](requirements-arm64.txt) and passes your wheelhouse
+to pip as `--find-links` for both build and runtime dependencies. Public indexes
+remain available unless you also specify `-NoIndex`; Torch is selected
+separately from NVIDIA. The manifest is based on the fork's
+[`bd3dc3d` requirements](https://github.com/vortex-captain/vllm-windows/tree/bd3dc3d3364a50012bf70b7376010c1b2c89633c/requirements).
+It includes common runtime, server, tokenizer, structured-output, Windows event
+loop and Triton dependencies. Numba 0.68.0, NVTX 0.2.16, fastsafetensors 0.4.0,
+and triton-windows 3.8.0.post29 replace older fork pins to use releases with
+Python 3.13 Windows ARM64 wheels.
+
+Some other dependencies (including tiktoken, outlines-core and OpenCV headless)
+do not currently publish matching ARM64 wheels. Supply compatible builds in
+your wheelhouse rather than relying on public package availability. Without
+a matching wheel, pip may attempt a source build, which can still fail if
+the package does not support Windows ARM64. Provisioning does not suppress
+such failures. TileLang and
+InstantTensor are optional acceleration/model-loading backends with no public
+Windows ARM64 wheels and are omitted from this build/kernel-smoke CI profile.
+The fork's x64-only dependencies are also excluded. This is not a claim of
+coverage for every model or optional serving backend.
+
+Use `-RequirementsFile` only to **override** the ARM64 default for a specialized
+environment. Omit legacy Torch pins and wheel URLs from overrides; incompatible
+pins fail rather than replacing the selected NVIDIA Torch.
+For x64, the existing explicit runtime manifest remains required, including its
+matching CUDA PyTorch wheel; this ARM64 default does not change the x64 setup.
 Use **Python 3.13-compatible wheels** (`cp313`, or an applicable `abi3`/pure
 Python wheel) for the matching Windows architecture. Python 3.12-only (`cp312`)
 wheels cannot be installed into this venv.
@@ -305,12 +326,17 @@ $tools = Get-Content 'C:\vllm-tools\arm64\toolchains.json' -Raw | ConvertFrom-Js
     -File .\buildkite\windows\provision-pool.ps1 `
     -Architecture arm64 `
     -ToolchainConfig 'C:\vllm-tools\arm64\toolchains.json' `
-    -RequirementsFile 'C:\pool-inputs\requirements-arm64.txt' `
-    -Wheelhouse 'C:\pool-inputs\wheels-arm64' -NoIndex `
+    -Wheelhouse 'C:\pool-inputs\wheels-arm64' `
     -CudaArchList '12.0+PTX;10.3a' `
     -CMakeCudaArchitectures '120-real;103-real' `
     -InstallRoot 'C:\bk\arm64'
 ```
+
+Replace the wheelhouse path with your actual directory. Add `-NoIndex` only
+if it contains the complete build/runtime dependency set; otherwise pip can
+use your local ARM64 wheels alongside public packages. pip selects compatible
+versions across both sources, so wheelhouse versions must satisfy the manifest.
+The NVIDIA Torch selection and exact-wheel constraint remain unchanged.
 
 For already provisioned toolchains, the original explicit
 `-PythonExecutable`, `-CudaPath`, `-VisualStudioPath`, `-PerlPath`, `-ProtocPath`,

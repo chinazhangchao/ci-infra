@@ -62,6 +62,67 @@ def load_provision(tmp_path, architecture="x64"):
     )
 
 
+def test_arm64_runtime_manifest_parses_and_does_not_pin_torch():
+    from packaging.requirements import Requirement
+
+    manifest = WINDOWS / "requirements-arm64.txt"
+    requirements = [
+        Requirement(line)
+        for raw in manifest.read_text().splitlines()
+        if (line := raw.split("#", 1)[0].strip())
+    ]
+    names = {req.name.lower().replace("_", "-") for req in requirements}
+    assert len(names) == len(requirements)
+    assert {"torch", "torchvision", "torchaudio", "vllm"}.isdisjoint(names)
+    assert {
+        "numpy",
+        "psutil",
+        "regex",
+        "requests",
+        "typing-extensions",
+        "transformers",
+        "tokenizers",
+        "safetensors",
+        "fastapi",
+        "pydantic",
+        "msgspec",
+        "pyzmq",
+        "triton-windows",
+        "winloop",
+        "portalocker",
+    } <= names
+    assert {"flashinfer-python", "xformers", "tilelang", "instanttensor"}.isdisjoint(
+        names
+    )
+    triton = next(req for req in requirements if req.name == "triton-windows")
+    assert triton.specifier.contains("3.8.0.post29")
+
+
+@pytest.mark.parametrize("custom", [False, True])
+def test_arm64_runtime_requirements_default_or_override(tmp_path, custom):
+    custom_file = tmp_path / "custom-requirements.txt"
+    custom_file.write_text("requests\n")
+    expected = custom_file if custom else WINDOWS / "requirements-arm64.txt"
+    result = run_ps(
+        tmp_path,
+        load_provision(tmp_path, "arm64")
+        + f"""
+$RequirementsFile = {literal(custom_file) if custom else "''"}
+function Assert-NativeHost {{}}
+function Resolve-RequiredPath {{
+    param($Path, $Type)
+    if ($Path -ne {literal(expected)}) {{ throw "Wrong runtime manifest: $Path" }}
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {{ throw 'Missing default manifest' }}
+    throw 'Reached expected runtime manifest before installing anything'
+}}
+Invoke-PoolProvisioning
+""",
+    )
+    assert result.returncode != 0
+    assert "Reached expected runtime manifest" in result.stderr
+    assert not (tmp_path / "pool").exists()
+
+
 @pytest.mark.parametrize("script", [PROVISION, LAUNCHER, TOOLCHAINS, FIND_TOOLS])
 def test_powershell_syntax(tmp_path, script):
     result = run_ps(
@@ -222,15 +283,27 @@ if ($hash -ine {literal(digest)}) {{ throw 'Incorrect recorded hash' }}
         assert not list((tmp_path / "pool").glob("*.zip"))
 
 
-@pytest.mark.parametrize("architecture", ["x64", "arm64"])
+@pytest.mark.parametrize(
+    "architecture,use_default,no_index",
+    [
+        ("x64", False, True),
+        ("arm64", False, True),
+        ("arm64", True, True),
+        ("arm64", True, False),
+    ],
+)
 @pytest.mark.parametrize(
     "failure", [None, "pip", "runtime", "not-venv", "wrong-venv-version"]
 )
-def test_provisioning_writes_complete_secret_free_pool(tmp_path, architecture, failure):
+def test_provisioning_writes_complete_secret_free_pool(
+    tmp_path, architecture, use_default, no_index, failure
+):
     inputs = tmp_path / "inputs with spaces"
     inputs.mkdir()
     requirements = inputs / "requirements.txt"
     requirements.write_text("placeholder manifest; native installs are mocked")
+    if use_default:
+        requirements = WINDOWS / "requirements-arm64.txt"
     platform = "win-amd64" if architecture == "x64" else "win-arm64"
     rust_host = (
         "x86_64-pc-windows-msvc" if architecture == "x64" else "aarch64-pc-windows-msvc"
@@ -245,9 +318,9 @@ def test_provisioning_writes_complete_secret_free_pool(tmp_path, architecture, f
         tmp_path,
         load_provision(tmp_path, architecture)
         + f"""
-$RequirementsFile = {literal(requirements)}
+$RequirementsFile = {literal(requirements) if not use_default else "''"}
 $Wheelhouse = {literal(inputs)}
-$NoIndex = $true
+$NoIndex = ${str(no_index).lower()}
 $CMakeCudaArchitectures = '120-real;103-real'
 $CudaPath = {literal(inputs / "CUDA")}
 $VisualStudioPath = {literal(inputs / "VS" / "vcvarsall.bat")}
@@ -328,6 +401,7 @@ $script:commands | ConvertTo-Json -Depth 5 |
         assert not (pool / "start-agent.ps1").exists()
         return
     assert result.returncode == 0, result.stderr
+    assert f"Using build/runtime wheelhouse: {inputs}" in result.stdout
     settings = json.loads((pool / "environment.json").read_text(encoding="utf-8"))
     env = settings["environment"]
     assert Path(env["VLLM_WINDOWS_VENV"]) == pool / "venv"
@@ -384,7 +458,8 @@ $script:commands | ConvertTo-Json -Depth 5 |
     )
     assert "--isolated" in installation
     assert str(WINDOWS / "requirements-toolchain.txt") in installation
-    assert "--no-index" in installation
+    assert str(requirements) in installation
+    assert ("--no-index" in installation) == no_index
     assert installation[installation.index("--find-links") + 1] == str(inputs)
     selection = [c["arguments"] for c in commands if "--dry-run" in c["arguments"]]
     if architecture == "arm64":

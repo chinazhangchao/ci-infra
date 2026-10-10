@@ -215,6 +215,9 @@ function Invoke-PoolProvisioning {
     if ($ToolchainConfig) {
         Import-ToolchainConfig $ToolchainConfig $Architecture
     }
+    if (-not $RequirementsFile -and $Architecture -eq "arm64") {
+        $RequirementsFile = Join-Path $PSScriptRoot "requirements-arm64.txt"
+    }
     if (-not $RequirementsFile -or -not $CudaArchList -or -not $PythonExecutable -or
         -not $CudaPath -or -not $VisualStudioPath) {
         throw "Pool preparation requires RequirementsFile, CudaArchList and either ToolchainConfig or the Python/CUDA/Visual Studio paths."
@@ -232,7 +235,9 @@ function Invoke-PoolProvisioning {
         throw "InstallRoot already exists: $root. Use a new directory; live pools are never overwritten."
     }
     $requirements = Resolve-RequiredPath $RequirementsFile Leaf
+    Write-Host "Using runtime requirements: $requirements"
     $wheels = if ($Wheelhouse) { Resolve-RequiredPath $Wheelhouse Container } else { "" }
+    if ($wheels) { Write-Host "Using build/runtime wheelhouse: $wheels" }
     if ($Architecture -eq "arm64" -and -not $CMakeCudaArchitectures) {
         throw "CMakeCudaArchitectures is required for ARM64 and must match CudaArchList."
     }
