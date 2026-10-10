@@ -15,6 +15,26 @@ TOOLCHAINS = WINDOWS / "install-toolchains.ps1"
 FIND_TOOLS = WINDOWS / "find-toolchains.ps1"
 PWSH = shutil.which("pwsh")
 pytestmark = pytest.mark.skipif(not PWSH, reason="Requires PowerShell 7")
+TORCH_INDEX = "https://pypi.nvidia.cn/nvtorch_oot_nightly/"
+TORCH_VERSION = "2.16.0.dev20261009+cu134"
+TORCH_URL = (
+    TORCH_INDEX + "torch/torch-2.16.0.dev20261009%2Bcu134-cp313-cp313-win_arm64.whl"
+)
+TORCH_HASH = "a" * 64
+
+
+def torch_report():
+    return {
+        "install": [
+            {
+                "metadata": {"name": "torch", "version": TORCH_VERSION},
+                "download_info": {
+                    "url": TORCH_URL,
+                    "archive_info": {"hashes": {"sha256": TORCH_HASH}},
+                },
+            }
+        ]
+    }
 
 
 def literal(value):
@@ -255,6 +275,11 @@ function Invoke-CheckedCommand {{
         New-Item -ItemType Directory -Path (Join-Path $InstallRoot 'venv\\Scripts') | Out-Null
         return
     }}
+    if ($Arguments -contains '--dry-run') {{
+        {literal(json.dumps(torch_report()))} |
+            Set-Content -LiteralPath $Arguments[[array]::IndexOf($Arguments, '--report') + 1]
+        return
+    }}
     if ($Arguments -contains 'install' -and {literal(failure or "")} -eq 'pip') {{
         throw 'Simulated dependency installation failure'
     }}
@@ -327,6 +352,15 @@ $script:commands | ConvertTo-Json -Depth 5 |
     assert (pool / "start-agent.ps1").read_bytes() == LAUNCHER.read_bytes()
     metadata = json.loads((pool / "provisioning.json").read_text(encoding="utf-8"))
     assert metadata["runtime"] == runtime
+    if architecture == "arm64":
+        assert metadata["torch_selection"]["Version"] == TORCH_VERSION
+        assert (pool / "torch-constraints.txt").read_text().strip() == (
+            f"torch @ {TORCH_URL}#sha256={TORCH_HASH}"
+        )
+    else:
+        assert metadata["torch_selection"] is None
+        assert not (pool / "torch-selection.json").exists()
+        assert not (pool / "torch-constraints.txt").exists()
     assert (
         metadata["requirements_sha256"].lower()
         == hashlib.sha256(requirements.read_bytes()).hexdigest()
@@ -343,12 +377,176 @@ $script:commands | ConvertTo-Json -Depth 5 |
     for command in commands:
         if "pip" in command["arguments"]:
             assert Path(command["file"]) == pool / "venv" / "Scripts" / "python.exe"
-    installation = next(c["arguments"] for c in commands if "install" in c["arguments"])
+    installation = next(
+        c["arguments"]
+        for c in commands
+        if "install" in c["arguments"] and "--dry-run" not in c["arguments"]
+    )
     assert "--isolated" in installation
     assert str(WINDOWS / "requirements-toolchain.txt") in installation
     assert "--no-index" in installation
     assert installation[installation.index("--find-links") + 1] == str(inputs)
+    selection = [c["arguments"] for c in commands if "--dry-run" in c["arguments"]]
+    if architecture == "arm64":
+        assert len(selection) == 1
+        assert selection[0][selection[0].index("--index-url") + 1] == TORCH_INDEX
+        assert "--no-index" not in selection[0]
+        assert "--find-links" not in selection[0]
+        assert "--pre" in selection[0]
+        assert "--ignore-installed" in selection[0]
+        assert "--only-binary=:all:" in selection[0]
+        assert "--no-deps" in selection[0]
+        assert selection[0][-1] == "torch"
+        assert f"torch=={TORCH_VERSION}" in installation
+        assert installation[installation.index("-c") + 1] == str(
+            pool / "torch-constraints.txt"
+        )
+    else:
+        assert not selection
+        assert "-c" not in installation
     assert any("check" in c["arguments"] for c in commands)
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        None,
+        "wrong-origin",
+        "x64-wheel",
+        "missing-hash",
+        "wrong-package",
+        "invalid-version",
+    ],
+)
+def test_nvidia_torch_selection_pins_exact_source_and_hash(tmp_path, invalid):
+    pool = tmp_path / "pool"
+    pool.mkdir()
+    report = torch_report()
+    package = report["install"][0]
+    if invalid == "wrong-origin":
+        package["download_info"]["url"] = TORCH_URL.replace(
+            "pypi.nvidia.cn", "example.org"
+        )
+    elif invalid == "x64-wheel":
+        package["download_info"]["url"] = TORCH_URL.replace("win_arm64", "win_amd64")
+    elif invalid == "missing-hash":
+        package["download_info"]["archive_info"]["hashes"]["sha256"] = ""
+    elif invalid == "wrong-package":
+        package["metadata"]["name"] = "torchvision"
+    elif invalid == "invalid-version":
+        package["metadata"]["version"] = "2.16\nother-package"
+    result = run_ps(
+        tmp_path,
+        load_provision(tmp_path)
+        + f"""
+function Invoke-CheckedCommand {{
+    param($File, $Arguments)
+    if ($File -ne 'venv-python.exe' -or $Arguments[-1] -ne 'torch') {{ throw 'Wrong selection command' }}
+    if ($Arguments -contains '-r' -or $Arguments -contains '-c' -or $Arguments -contains '--extra-index-url') {{
+        throw 'Do not let runtime pins or other indexes affect the latest Torch selection'
+    }}
+    {literal(json.dumps(report))} |
+        Set-Content -LiteralPath $Arguments[[array]::IndexOf($Arguments, '--report') + 1]
+}}
+$selection = Select-NvidiaTorch 'venv-python.exe' {literal(pool)}
+if ($selection.Version -ne '{TORCH_VERSION}') {{ throw 'Wrong selected version' }}
+""",
+    )
+    if invalid:
+        assert result.returncode != 0
+        assert not (pool / "torch-constraints.txt").exists()
+    else:
+        assert result.returncode == 0, result.stderr
+        assert (pool / "torch-constraints.txt").read_text().strip() == (
+            f"torch @ {TORCH_URL}#sha256={TORCH_HASH}"
+        )
+
+
+def test_nvidia_torch_selection_failure_has_no_fallback(tmp_path):
+    pool = tmp_path / "pool"
+    pool.mkdir()
+    result = run_ps(
+        tmp_path,
+        load_provision(tmp_path)
+        + """
+$script:calls = 0
+function Invoke-CheckedCommand {
+    $script:calls++
+    throw 'No compatible NVIDIA wheel available'
+}
+try {
+    Select-NvidiaTorch 'venv-python.exe' $InstallRoot
+} finally {
+    if ($script:calls -ne 1) { throw 'Unexpected fallback installation' }
+}
+""",
+    )
+    assert result.returncode != 0
+    assert "No compatible NVIDIA wheel available" in result.stderr
+    assert not (pool / "torch-constraints.txt").exists()
+
+
+@pytest.mark.parametrize("conflicting_pin", [False, True])
+def test_pip_resolves_nightly_torch_url_constraint_without_downgrade(
+    tmp_path, conflicting_pin
+):
+    wheel = tmp_path / f"torch-{TORCH_VERSION}-py3-none-any.whl"
+    metadata_dir = f"torch-{TORCH_VERSION}.dist-info"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr(
+            f"{metadata_dir}/METADATA",
+            f"Metadata-Version: 2.1\nName: torch\nVersion: {TORCH_VERSION}\n",
+        )
+        archive.writestr(
+            f"{metadata_dir}/WHEEL",
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+        )
+        archive.writestr(f"{metadata_dir}/RECORD", "")
+    checksum = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    constraints = tmp_path / "torch-constraints.txt"
+    constraints.write_text(f"torch @ {wheel.as_uri()}#sha256={checksum}\n")
+    requirements = tmp_path / "runtime.txt"
+    requirements.write_text("torch==2.11.0\n" if conflicting_pin else "torch\n")
+    report = tmp_path / "resolution.json"
+    # Exercise pip's direct-URL constraint behavior without installing a package
+    # or accessing an external index.
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-m",
+            "pip",
+            "--isolated",
+            "--disable-pip-version-check",
+            "install",
+            "--dry-run",
+            "--ignore-installed",
+            "--no-index",
+            "--no-deps",
+            "-r",
+            str(requirements),
+            "-c",
+            str(constraints),
+            f"torch=={TORCH_VERSION}",
+            "--report",
+            str(report),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if conflicting_pin:
+        assert result.returncode != 0
+        assert "ResolutionImpossible" in result.stderr
+        assert not report.exists()
+    else:
+        assert result.returncode == 0, result.stderr
+        selected = json.loads(report.read_text())["install"]
+        assert len(selected) == 1
+        assert selected[0]["metadata"]["version"] == TORCH_VERSION
+        assert (
+            selected[0]["download_info"]["archive_info"]["hashes"]["sha256"] == checksum
+        )
 
 
 @pytest.mark.parametrize("version", [[3, 12, 10], [3, 14, 8], [3, 13, 15]])

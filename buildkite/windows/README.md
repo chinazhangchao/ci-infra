@@ -70,6 +70,11 @@ from [requirements-toolchain.txt](requirements-toolchain.txt), plus your
 runtime dependency manifest/private wheels, into an isolated venv. It verifies
 native Python, PyTorch and actual GPU execution, installs the native Buildkite
 agent with checksum verification, and generates a launcher.
+For **ARM64**, it selects the latest compatible Torch wheel (including
+development/nightly versions) from
+[`https://pypi.nvidia.cn/nvtorch_oot_nightly/`](https://pypi.nvidia.cn/nvtorch_oot_nightly/).
+This index currently publishes Windows ARM64 wheels only; **x64 Torch
+installation remains controlled by the runtime manifest/wheelhouse**.
 Both Windows architectures default to **Python 3.13**. The pool creates
 `<InstallRoot>\venv` using the selected interpreter, without system-site
 packages, and checks that it is a real venv with the expected Python version
@@ -111,9 +116,10 @@ header layouts rather than silently patching them. The build uses `--no-isolatio
 `--skip-dependency-check`, as the ARM64 helper does: the fork's generic
 `pyproject.toml` Torch pin differs from its Windows requirements.
 
-**arm64:** The helper on the selected branch requires a **private Windows ARM64
-PyTorch build for CUDA 13.4** and the ARM64 CUDA toolkit/libraries. Public x64
-PyTorch wheels are not substitutes. Provision compatible ARM64 build and
+**arm64:** The helper on the selected branch requires **Windows ARM64 PyTorch
+built for CUDA 13.4** and the ARM64 CUDA toolkit/libraries. Provisioning selects
+Torch from NVIDIA's nightly index automatically; x64 wheels are not substitutes.
+Provision the remaining compatible ARM64 build and
 runtime dependencies from your own wheelhouse; do not blindly install the
 x64-only pins in the generic requirements. At the time of integration, the
 helper defaults to MSVC `14.51.36231` for CUDA, MSVC `14.44.35207` for
@@ -233,22 +239,44 @@ already contains a previous pool/venv, choose a new root rather than replacing
 its Python in place.
 
 Prepare a requirements file for each architecture containing **runtime
-dependencies**, including the matching CUDA PyTorch wheel. Prefer a
+dependencies**. For x64, include the matching CUDA PyTorch wheel as before.
+For ARM64, **omit legacy Torch version pins and wheel URLs**: the script selects
+Torch from NVIDIA's index automatically. Prefer a
 tested, version-pinned manifest and prebuilt dependency wheels. Do not include
 vLLM itself. For x64, the fork's three requirements files listed above are the
 starting point; its CUDA Torch pins need the matching PyTorch index or your
-wheelhouse. For ARM64, provide your private CUDA 13.4 Torch wheel and other
-ARM64 dependencies through `-Wheelhouse` or explicit references in the manifest.
-The script cannot manufacture these private packages.
+wheelhouse. For ARM64, provide the remaining dependencies through `-Wheelhouse`
+or explicit references in the manifest.
 Use **Python 3.13-compatible wheels** (`cp313`, or an applicable `abi3`/pure
-Python wheel) for the matching Windows architecture, including your ARM64 CUDA
-PyTorch wheel. Python 3.12-only (`cp312`) wheels cannot be installed into this venv.
+Python wheel) for the matching Windows architecture. Python 3.12-only (`cp312`)
+wheels cannot be installed into this venv.
+
+ARM64 Torch selection runs inside the new venv with pip's `--pre`,
+`--ignore-installed`, `--no-deps`, and `--only-binary=:all:` options. This is a
+**dry run** to choose the latest wheel for that Python/architecture, not an
+installation without dependencies. The chosen wheel's version, NVIDIA URL, and
+SHA-256 are recorded in `torch-selection.json`; `torch-constraints.txt` then
+locks dependency installation to that exact URL/hash and version. Dependencies
+are resolved normally, so missing dependencies or incompatible runtime pins
+fail provisioning rather than downgrading Torch or falling back to PyPI.
+If the manifest includes `torchvision`, `torchaudio`, or other native Torch
+extensions, supply versions compatible with the selected Torch build; their
+sources are still controlled by your manifest. A nightly Torch build can expose
+vLLM build incompatibilities, which must be resolved rather than hidden by a
+version fallback.
+
+"Latest" is evaluated when preparing a **new pool**, not at every CI job.
+Existing venvs are not upgraded in place. Create a new `InstallRoot` to refresh
+Torch, leaving running agents undisturbed.
 
 The script installs `build`, CMake, Ninja, setuptools, setuptools-scm,
 setuptools-rust, wheel, packaging, Jinja2, regex, and the Python protobuf package
 from its own build-requirements file. Your manifest can further constrain those
 versions. With `-NoIndex`, your wheelhouse must contain **both** build and runtime
-dependency wheels. Index settings, if needed, go in your
+dependency wheels (except the automatically selected ARM64 Torch wheel).
+**On ARM64, `-NoIndex` applies only to the remaining dependency installation**:
+Torch selection still contacts NVIDIA's index and the selected wheel URL is
+downloaded. This mode is not fully offline. Index settings, if needed, go in your
 trusted manifest: pip runs with `--isolated`, ignoring user pip configuration
 and `PIP_*` environment variables. `-NoIndex` disables package-index lookup;
 direct URL references in a manifest are still honored by pip. For disconnected
@@ -302,6 +330,8 @@ On success, the root contains `venv`, `bin\buildkite-agent.exe`,
 `start-agent.ps1`, `checkouts`, and `work`. The launcher sets the per-agent
 environment shown above, so you do not need to set it manually. It preserves
 the agent's exit code and restores the calling process environment on exit.
+ARM64 pools also retain `torch-selection.json` and `torch-constraints.txt` for
+the selected NVIDIA Torch version, source URL, and checksum.
 
 Supply a cluster agent token **at startup**, not during provisioning. For
 example, have your secret manager place it in a protected file readable only

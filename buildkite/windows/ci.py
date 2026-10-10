@@ -266,7 +266,7 @@ def build(architecture):
         )
     if architecture == "arm64" and runtime["cuda"] != "13.4":
         raise ValueError(
-            "The fork's ARM64 helper requires private PyTorch built for CUDA 13.4."
+            "The fork's ARM64 helper requires PyTorch built for CUDA 13.4."
         )
     (output / "runtime.json").write_text(
         json.dumps(runtime, indent=2) + "\n", encoding="utf-8"

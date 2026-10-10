@@ -69,6 +69,40 @@ function Invoke-CheckedCommand {
     }
 }
 
+function Select-NvidiaTorch {
+    param([string]$Python, [string]$Root)
+    $index = "https://pypi.nvidia.cn/nvtorch_oot_nightly/"
+    $reportPath = Join-Path $Root "torch-selection.json"
+    Invoke-CheckedCommand $Python @(
+        "-I", "-m", "pip", "--isolated", "--disable-pip-version-check", "install",
+        "--dry-run", "--ignore-installed", "--no-deps", "--pre", "--only-binary=:all:",
+        "--index-url", $index, "--report", $reportPath, "torch"
+    )
+    $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
+    $packages = @($report.install)
+    if ($packages.Count -ne 1 -or $packages[0].metadata.name -ne "torch") {
+        throw "NVIDIA Torch selection must contain exactly one torch wheel."
+    }
+    $package = $packages[0]
+    $version = $package.metadata.version
+    $url = [uri]$package.download_info.url
+    $hash = $package.download_info.archive_info.hashes.sha256
+    if ($version -notmatch '^\d[0-9A-Za-z.!+_-]*$' -or
+        $url.Scheme -ne "https" -or $url.Authority -ne "pypi.nvidia.cn" -or
+        -not $url.AbsolutePath.StartsWith("/nvtorch_oot_nightly/torch/", [StringComparison]::Ordinal) -or
+        -not $url.AbsolutePath.EndsWith("-win_arm64.whl", [StringComparison]::Ordinal) -or
+        $hash -notmatch '^[a-fA-F0-9]{64}$') {
+        throw "Expected a SHA-256-identified Windows ARM64 Torch wheel from $index."
+    }
+    $wheel = [UriBuilder]::new($url)
+    $wheel.Fragment = "sha256=$hash"
+    $constraints = Join-Path $Root "torch-constraints.txt"
+    "torch @ $($wheel.Uri.AbsoluteUri)" |
+        Set-Content -LiteralPath $constraints -Encoding utf8
+    Write-Host "Selected NVIDIA Torch $version. Runtime requirements must not pin an incompatible Torch version."
+    return @{ Version = $version; Constraints = $constraints }
+}
+
 function Resolve-Tool {
     param([string]$Path)
     $command = Get-Command $Path -CommandType Application -ErrorAction Stop
@@ -309,11 +343,20 @@ function Invoke-PoolProvisioning {
     }
     $originalEnvironment = @{}
     $originalPath = $env:PATH
+    $torchSelection = $null
     try {
         $env:PATH = (@($paths) + @($originalPath)) -join [IO.Path]::PathSeparator
         foreach ($entry in $dependencyEnvironment.GetEnumerator()) {
             $originalEnvironment[$entry.Key] = [Environment]::GetEnvironmentVariable($entry.Key, "Process")
             [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
+        }
+        if ($Architecture -eq "arm64") {
+            Write-Host "Selecting the latest compatible Torch from NVIDIA's nightly index."
+            if ($NoIndex) {
+                Write-Host "NoIndex applies to the remaining dependencies; Torch selection still uses NVIDIA's index."
+            }
+            $torchSelection = Select-NvidiaTorch $venvPython $root
+            $pipArguments += @("-c", $torchSelection.Constraints, "torch==$($torchSelection.Version)")
         }
         Write-Host "Installing the pool's dependency manifest into $venv"
         Invoke-CheckedCommand $venvPython $pipArguments
@@ -390,6 +433,7 @@ git-clean-flags="-ffdx"
         agent_version = $AgentVersion
         agent_sha256 = $agentHash
         requirements_sha256 = (Get-FileHash -LiteralPath $requirements -Algorithm SHA256).Hash
+        torch_selection = $torchSelection
         runtime = $runtime
     } | ConvertTo-Json -Depth 5 |
         Set-Content -LiteralPath (Join-Path $root "provisioning.json") -Encoding utf8
