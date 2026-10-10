@@ -5,8 +5,6 @@ param(
     [switch]$InstallToolchains,
     [string]$ToolchainRoot = "",
     [string]$ToolchainConfig = "",
-    [string]$CudaInstallerPath = "",
-    [string]$CudaInstallerSha256 = "",
     [ValidatePattern('^3\.(10|11|12|13|14)\.\d+$')][string]$PythonVersion = "3.12.10",
     [string]$PythonExecutable = "",
     [string]$CudaPath = "",
@@ -404,7 +402,7 @@ if ($MyInvocation.InvocationName -ne ".") {
             "PerlPath", "ProtocPath", "ProtocIncludePath", "VisualStudioPath", "RustVisualStudioPath")) {
             if ($PSBoundParameters.ContainsKey($name)) { $existing[$name] = $PSBoundParameters[$name] }
         }
-        exit (Install-WindowsToolchains $Architecture $toolsRoot $CudaInstallerPath $CudaInstallerSha256 $CudaPath $PythonVersion $existing)
+        exit (Install-WindowsToolchains $Architecture $toolsRoot $CudaPath $PythonVersion $existing)
     } else {
         Invoke-PoolProvisioning
     }

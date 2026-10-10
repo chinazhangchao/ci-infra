@@ -620,24 +620,21 @@ if ([bool]$python -ne ${str(found).lower()}) {{ throw 'Wrong Python was reused' 
     assert result.returncode == 0, result.stderr
 
 
-@pytest.mark.skipif(
-    sys.platform != "win32", reason="Uses Windows installer preflight paths"
-)
-def test_private_arm64_installer_is_required_before_any_install(tmp_path):
-    root = tmp_path / "machine tools"
+def test_cuda_installer_parameters_are_removed(tmp_path):
     result = run_ps(
         tmp_path,
         f"""
 . {literal(TOOLCHAINS)}
-function Assert-ToolchainInstallerHost {{}}
-function Set-ToolchainDirectoryPermissions {{}}
-function Find-CudaToolkit {{ return $null }}
-Install-WindowsToolchains 'arm64' {literal(root)} '' '' '' '3.12.10'
+$entry = Get-Command {literal(PROVISION)}
+$installer = Get-Command Install-WindowsToolchains
+foreach ($name in @('CudaInstallerPath', 'CudaInstallerSha256', 'CudaInstaller')) {{
+    if ($entry.Parameters.ContainsKey($name) -or $installer.Parameters.ContainsKey($name)) {{
+        throw "Obsolete installer parameter: $name"
+    }}
+}}
 """,
     )
-    assert result.returncode != 0
-    assert "private CUDA 13.4" in result.stderr
-    assert list(root.iterdir()) == [root / ".vllm-toolchains.json"]
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Uses built-in Windows PowerShell")
@@ -645,7 +642,7 @@ def test_install_mode_dispatches_from_windows_powershell_51(tmp_path):
     shutil.copyfile(PROVISION, tmp_path / "provision-pool.ps1")
     (tmp_path / "install-toolchains.ps1").write_text(
         "function Install-WindowsToolchains {\n"
-        "param($Target,$Root,$CudaInstaller,$Sha256,$CudaPath,$PythonVersion)\n"
+        "param($Target,$Root,$CudaPath,$PythonVersion,$ExistingTools)\n"
         "if ($Target -ne 'arm64' -or $PythonVersion -ne '3.12.10') { throw 'Wrong arguments' }\n"
         "'dispatched without running installers' | Set-Content (Join-Path $PSScriptRoot 'dispatched.txt')\n"
         "return 3010\n"
@@ -680,8 +677,6 @@ def test_install_mode_dispatches_from_windows_powershell_51(tmp_path):
 def test_full_toolchain_orchestration_without_real_installers(tmp_path, architecture):
     root = tmp_path / "machine tools"
     cuda = tmp_path / "CUDA"
-    private_installer = tmp_path / "private-cuda.exe"
-    private_installer.write_bytes(b"private installer is never executed")
     sdk = tmp_path / "program-files-x86"
     result = run_ps(
         tmp_path,
@@ -773,8 +768,6 @@ function Invoke-CheckedCommand {{
     }}
 }}
 $status = Install-WindowsToolchains '{architecture}' {literal(root)} `
-    {literal(private_installer) if architecture == "arm64" else "''"} `
-    {literal(hashlib.sha256(private_installer.read_bytes()).hexdigest()) if architecture == "arm64" else "''"} `
     {literal(cuda)} '3.12.10'
 if ($status -ne 0) {{ throw 'Unexpected installer status' }}
 if ($env:CARGO_HOME -ne 'original-cargo' -or $env:RUSTUP_HOME -ne 'original-rustup') {{
@@ -817,8 +810,25 @@ if ($env:CARGO_HOME -ne 'original-cargo' -or $env:RUSTUP_HOME -ne 'original-rust
         for url in urls
     )
     assert any("rustup-init.exe" in url for url in urls)
-    if architecture == "arm64":
-        assert not any("developer.download.nvidia.com" in url for url in urls)
-    else:
-        assert any("cuda_13.0.0_windows.exe" in url for url in urls)
+    cuda_url = (
+        "https://developer.download.nvidia.com/compute/cuda/13.4.2/local_installers/cuda_13.4.2_windows_arm64.exe"
+        if architecture == "arm64"
+        else "https://developer.download.nvidia.com/compute/cuda/13.0.0/local_installers/cuda_13.0.0_windows.exe"
+    )
+    cuda_downloads = [
+        item
+        for item in operations["downloads"]
+        if "developer.download.nvidia.com" in item["url"]
+    ]
+    assert len(cuda_downloads) == 1
+    assert cuda_downloads[0]["url"] == cuda_url
+    assert cuda_downloads[0]["publisher"] == "NVIDIA Corporation"
+    cuda_installs = [
+        item
+        for item in operations["installers"]
+        if Path(item["file"]).name == cuda_url.rsplit("/", 1)[-1]
+    ]
+    assert len(cuda_installs) == 1
+    assert cuda_installs[0]["arguments"] == ["-s", "-n"]
+    if architecture == "x64":
         assert (root / "cuda.h.original").exists()

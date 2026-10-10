@@ -284,8 +284,6 @@ def test_only_missing_tool_installed_and_rerun_downloads_nothing(
     system = tmp_path / "existing"
     cuda = system / "cuda"
     output = tmp_path / "downloads.json"
-    private = tmp_path / "private-cuda.exe"
-    private.write_bytes(b"trusted test placeholder")
     result = run_ps(
         tmp_path,
         f"""
@@ -366,22 +364,24 @@ function Invoke-CheckedCommand {{
     param($File, $Arguments, [switch]$Capture)
     if ($File -like '*nvcc.exe') {{ return 'CUDA release {"13.4" if architecture == "arm64" else "13.0"}' }}
 }}
-$private = {literal(private) if architecture == "arm64" and missing == "cuda" else "''"}
-$hash = {literal(hashlib.sha256(private.read_bytes()).hexdigest()) if architecture == "arm64" and missing == "cuda" else "''"}
-[void](Install-WindowsToolchains '{architecture}' {literal(root)} $private $hash $cuda)
+[void](Install-WindowsToolchains '{architecture}' {literal(root)} $cuda)
 $count = $script:downloads.Count
 function Invoke-ToolchainInstaller {{ throw 'Rerun must not run installers' }}
 function Expand-Archive {{ throw 'Rerun must not extract archives' }}
-[void](Install-WindowsToolchains '{architecture}' {literal(root)} '' '' $cuda)
+[void](Install-WindowsToolchains '{architecture}' {literal(root)} $cuda)
 if ($script:downloads.Count -ne $count) {{ throw 'Rerun downloaded tools again' }}
 ConvertTo-Json -InputObject @($script:downloads) | Set-Content {literal(output)}
 """,
     )
     assert result.returncode == 0, result.stderr
     downloads = json.loads(output.read_text())
-    assert len(downloads) == (
-        0 if missing == "none" or (architecture == "arm64" and missing == "cuda") else 1
-    )
+    assert len(downloads) == (0 if missing == "none" else 1)
+    if missing == "cuda":
+        assert downloads == [
+            "https://developer.download.nvidia.com/compute/cuda/13.4.2/local_installers/cuda_13.4.2_windows_arm64.exe"
+            if architecture == "arm64"
+            else "https://developer.download.nvidia.com/compute/cuda/13.0.0/local_installers/cuda_13.0.0_windows.exe"
+        ]
     config = json.loads((root / "toolchains.json").read_text(encoding="utf-8-sig"))
     assert config["architecture"] == architecture
     for key in [

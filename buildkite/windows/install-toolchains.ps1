@@ -252,8 +252,6 @@ function Install-WindowsToolchains {
     param(
         [string]$Target,
         [string]$Root,
-        [string]$CudaInstaller,
-        [string]$CudaInstallerSha256,
         [string]$RequestedCudaPath,
         [string]$PythonVersion = "3.12.10",
         [hashtable]$ExistingTools = @{}
@@ -265,18 +263,6 @@ function Install-WindowsToolchains {
     $previous = Initialize-ToolchainRoot $Root $Target
     foreach ($entry in $ExistingTools.GetEnumerator()) { $previous[$entry.Key] = $entry.Value }
     $cuda = Find-CudaToolkit $Target @($RequestedCudaPath, $previous["CudaPath"])
-    if (-not $cuda -and $Target -eq "arm64" -and -not $CudaInstaller) {
-        throw "ARM64 requires -CudaInstallerPath and -CudaInstallerSha256 for your private CUDA 13.4 Windows ARM64 installer."
-    }
-    if (-not $cuda -and $CudaInstaller) {
-        if (-not (Test-Path -LiteralPath $CudaInstaller -PathType Leaf) -or
-            [IO.Path]::GetExtension($CudaInstaller) -ine ".exe") {
-            throw "CudaInstallerPath must be an existing NVIDIA Windows installer .exe."
-        }
-        if (-not $CudaInstallerSha256) { throw "CudaInstallerSha256 is required for a supplied installer." }
-        Assert-Payload $CudaInstaller $CudaInstallerSha256 ""
-        $CudaInstaller = (Resolve-Path -LiteralPath $CudaInstaller).Path
-    }
     $script:ToolchainRebootMarker = Join-Path $Root ".reboot-required"
     $script:ToolchainRebootRequired = (Test-Path -LiteralPath $script:ToolchainRebootMarker) -and
         (Get-Content -LiteralPath $script:ToolchainRebootMarker -Raw).Trim() -eq (Get-ToolchainBootIdentity)
@@ -388,12 +374,14 @@ function Install-WindowsToolchains {
     foreach ($entry in $msvc.GetEnumerator()) { $parameters[$entry.Key] = $entry.Value }
     $cudaVersion = if ($isArm) { "13.4" } else { "13.0" }
     if (-not $cuda) {
-        if (-not $CudaInstaller) {
-            $CudaInstaller = Get-ToolchainPayload `
-                "https://developer.download.nvidia.com/compute/cuda/13.0.0/local_installers/cuda_13.0.0_windows.exe" `
-                (Join-Path $downloads "cuda.exe") -Publisher "NVIDIA Corporation"
+        $cudaUrl = if ($isArm) {
+            "https://developer.download.nvidia.com/compute/cuda/13.4.2/local_installers/cuda_13.4.2_windows_arm64.exe"
+        } else {
+            "https://developer.download.nvidia.com/compute/cuda/13.0.0/local_installers/cuda_13.0.0_windows.exe"
         }
-        Invoke-ToolchainInstaller $CudaInstaller @("-s", "-n")
+        $cudaInstaller = Get-ToolchainPayload $cudaUrl `
+            (Join-Path $downloads ([uri]$cudaUrl).Segments[-1]) -Publisher "NVIDIA Corporation"
+        Invoke-ToolchainInstaller $cudaInstaller @("-s", "-n")
         $cuda = if ($RequestedCudaPath) { [IO.Path]::GetFullPath($RequestedCudaPath) } else {
             Join-Path $env:ProgramFiles "NVIDIA GPU Computing Toolkit\CUDA\v$cudaVersion"
         }

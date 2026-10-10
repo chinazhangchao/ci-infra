@@ -35,7 +35,7 @@ or saves an agent token.
 | Python | Native architecture, requested major/minor, patch version at least `-PythonVersion`, with venv/ensurepip | Python 3.12.10 by default; configurable with `-PythonVersion` |
 | MSVC | Target compiler, linker, headers and libraries: x64 14.44; ARM64 14.51 for CUDA and 14.44 for Rust/OpenSSL | Only missing compiler components, using VS 2022 or VS 2026 18.6.3 |
 | Windows SDK | SDK 10.0.26100.0 headers, target libraries and resource compiler | Only the missing SDK component |
-| CUDA | x64 13.0 / ARM64 13.4, `nvcc`, `ptxas`, header and all required target libraries | Public CUDA 13.0 for x64; **your supplied private CUDA 13.4 installer** for ARM64 |
+| CUDA | x64 13.0 / ARM64 13.4, `nvcc`, `ptxas`, header and all required target libraries | NVIDIA's public CUDA 13.0 installer for x64; CUDA 13.4.2 installer for ARM64 |
 | Rust / Cargo | Native MSVC host, Rust and Cargo 1.95+, complete pair resolved from the actual toolchain rather than a user-specific rustup proxy | Native Rust/Cargo 1.95.0 |
 | Perl | Working Perl with `Locale::Maketext::Simple` and `IPC::Cmd` | Full Strawberry Perl 5.42.3.1 portable distribution |
 | `protoc` | Version 29+, working compiler and standard `google\protobuf\struct.proto` include tree | Protobuf compiler 33.0 and standard includes |
@@ -166,24 +166,22 @@ For **ARM64**:
 ```powershell
 .\buildkite\windows\provision-pool.ps1 `
     -Architecture arm64 -InstallToolchains `
-    -ToolchainRoot 'C:\vllm-tools\arm64' `
-    -CudaInstallerPath 'C:\pool-inputs\cuda-13.4-windows-arm64.exe' `
-    -CudaInstallerSha256 '<SHA-256 supplied by your CUDA package provider>'
+    -ToolchainRoot 'C:\vllm-tools\arm64'
 ```
 
-**Omit `-CudaInstallerPath` and `-CudaInstallerSha256` if compatible ARM64 CUDA
-13.4 is already installed.** They are required only when CUDA is missing or
-incomplete; an unused installer path is not read or validated.
-
-When needed, the ARM64 installer must be your Windows ARM64 CUDA 13.4 package, supporting
-NVIDIA's `-s -n` unattended/no-automatic-reboot options. It must install the
-required ARM64 libraries and a compatible NVIDIA GPU driver (or the driver
-must already be present). There is no assumed public download for this private
-toolkit. Supply its **trusted SHA-256**, not an unchecked download URL.
-The default expected CUDA destination is
+When compatible CUDA is missing or incomplete, the script downloads the
+architecture-specific local installer directly from NVIDIA. ARM64 uses the
+pinned [CUDA 13.4.2 Windows ARM64 installer](https://developer.download.nvidia.com/compute/cuda/13.4.2/local_installers/cuda_13.4.2_windows_arm64.exe)
+listed on [NVIDIA's download page](https://developer.nvidia.com/cuda-downloads?target_os=Windows&target_arch=arm64&target_version=11&target_type=exe_local).
+No installer-path or checksum parameters are needed. The script validates
+NVIDIA's Authenticode signature before running it with `-s -n` (silent,
+no automatic reboot), and caches downloads by version and architecture.
+Existing compatible CUDA 13.4 installations are reused without downloading
+or upgrading to 13.4.2. The default expected ARM64 CUDA destination is
 `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4`; use `-CudaPath`
-if your private installer uses another directory. This specifies where to
-verify the install, not an installer destination override.
+to discover an existing installation in another directory. This is not an
+installer destination override. The ARM64 PyTorch/runtime wheel requirements
+below are unchanged.
 
 Both architectures receive missing Perl and `protoc` automatically; no `-PerlPath`
 or `-ProtocPath` is needed for standard/PATH installations. Public archive downloads have pinned
