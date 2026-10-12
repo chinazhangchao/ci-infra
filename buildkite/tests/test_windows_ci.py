@@ -72,7 +72,8 @@ def test_pipeline_routes_selected_native_architectures(
     pipeline = yaml.safe_load(
         (ROOT / ".buildkite" / "pipelines" / filename).read_text()
     )
-    source, *builds = pipeline["steps"]
+    source, *steps = pipeline["steps"]
+    builds = [step for step in steps if step.get("key", "").startswith("windows-cuda-")]
     assert len(builds) == len(architectures)
     assert source["key"] == "windows-source"
     assert source["command"] == r"python buildkite\windows\ci.py resolve"
@@ -85,18 +86,35 @@ def test_pipeline_routes_selected_native_architectures(
         assert step["agents"] == {"queue": f"${{{variable}:-windows-{architecture}}}"}
         assert step["key"] == f"windows-cuda-{architecture}"
         assert step["depends_on"] == source["key"]
-        full_suite = filename == "windows-arm64.yml"
+        build_only = filename == "windows-arm64.yml"
         assert step["command"] == (
             rf"python buildkite\windows\ci.py build --architecture {architecture}"
-            + (" --test-suite full" if full_suite else "")
+            + (" --test-suite none" if build_only else "")
         )
         assert step["artifact_paths"] == [f"artifacts/windows-{architecture}/**/*"]
-        assert step["timeout_in_minutes"] == (
-            1440 if full_suite else {"x64": 240, "arm64": 360}[architecture]
-        )
+        assert step["timeout_in_minutes"] == {"x64": 240, "arm64": 360}[architecture]
         assert step["retry"] == {"automatic": [{"exit_status": -1, "limit": 1}]}
         assert "plugins" not in step
         assert not step.get("soft_fail")
+
+    if filename == "windows-arm64.yml":
+        assert len(steps) == 3
+        approval, test = steps[1:]
+        assert approval["key"] == "windows-arm64-test-approval"
+        assert approval["depends_on"] == "windows-cuda-arm64"
+        assert "block" in approval
+        assert "agents" not in approval
+        assert test["depends_on"] == ["windows-cuda-arm64", approval["key"]]
+        assert (
+            test["command"]
+            == r"python buildkite\windows\ci.py test --architecture arm64"
+        )
+        assert test["agents"] == builds[0]["agents"]
+        assert test["timeout_in_minutes"] == 1440
+        assert test["artifact_paths"] == ["artifacts/windows-arm64-tests/**/*"]
+        assert not test.get("soft_fail")
+    else:
+        assert len(steps) == 2
 
 
 def test_resolve_pins_branch_once(monkeypatch):

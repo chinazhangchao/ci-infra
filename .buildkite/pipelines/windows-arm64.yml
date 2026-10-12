@@ -7,14 +7,35 @@ steps:
     command: 'python buildkite\windows\ci.py resolve'
     timeout_in_minutes: 10
 
-  - label: ":windows: CUDA wheel and full pytest suite (arm64)"
+  - label: ":windows: Build CUDA wheel (arm64)"
     key: windows-cuda-arm64
     depends_on: windows-source
     agents:
       queue: "${WINDOWS_ARM64_QUEUE:-windows-arm64}"
-    command: 'python buildkite\windows\ci.py build --architecture arm64 --test-suite full'
+    command: 'python buildkite\windows\ci.py build --architecture arm64 --test-suite none'
     artifact_paths:
       - "artifacts/windows-arm64/**/*"
+    timeout_in_minutes: 360
+    retry:
+      automatic:
+        - exit_status: -1
+          limit: 1
+
+  - block: ":pytest: Run full ARM64 test suite"
+    key: windows-arm64-test-approval
+    depends_on: windows-cuda-arm64
+    prompt: "The wheel is built. Start the full vLLM test suite using this build's wheel?"
+
+  - label: ":windows: Full pytest suite (arm64)"
+    key: windows-tests-arm64
+    depends_on:
+      - windows-cuda-arm64
+      - windows-arm64-test-approval
+    agents:
+      queue: "${WINDOWS_ARM64_QUEUE:-windows-arm64}"
+    command: 'python buildkite\windows\ci.py test --architecture arm64'
+    artifact_paths:
+      - "artifacts/windows-arm64-tests/**/*"
     timeout_in_minutes: 1440
     retry:
       automatic:

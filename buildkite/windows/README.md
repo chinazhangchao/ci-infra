@@ -8,9 +8,10 @@ Existing Linux pipelines and the Linux-oriented pipeline generator are unchanged
 
 For **ARM64 only**, upload
 [windows-arm64.yml](../../.buildkite/pipelines/windows-arm64.yml) instead.
-It builds the wheel and attempts the **entire fork `tests` pytest tree,
-including optional tests**. This preserves the combined pipeline's smoke-test
-and x64 settings and requires only an ARM64 queue and agent.
+It builds the wheel, pauses for **manual approval**, then runs a separate job
+attempting the **entire fork `tests` pytest tree, including optional tests**.
+Tests can be retried without recompiling. This preserves the combined pipeline's
+smoke-test and x64 settings and requires only an ARM64 queue.
 
 The resolver freezes the branch tip in Buildkite metadata once per build. Both
 architectures, including retries, fetch that same SHA into separate temporary
@@ -33,9 +34,30 @@ in `smoke.json`, and runs `_C.silu_and_mul` for either layout.
 
 ### Full ARM64 pytest suite
 
-`windows-arm64.yml` runs `ci.py build --architecture arm64 --test-suite full`
-instead of the one-kernel smoke test. After compilation, it creates a disposable
-test venv, makes the provisioned pool dependencies available through a `.pth`
+`windows-arm64.yml` has four ordered steps:
+
+1. **Resolve vLLM source:** freeze the fork commit for this Buildkite build.
+2. **Build CUDA wheel:** `ci.py build --architecture arm64 --test-suite none`
+   compiles and validates the wheel, then uploads the wheel, SHA-256 sidecar,
+   source/runtime metadata and `build-manifest.json`. It runs no tests.
+3. **Run full ARM64 test suite:** a manual approval block after the build
+   succeeds. The pipeline can remain here until you are ready to test.
+4. **Full pytest suite:** `ci.py test --architecture arm64` downloads artifacts
+   from the recorded producer job ID in the **same Buildkite build**, verifies
+   both manifest and wheel checksums, and checks out tests from the wheel's
+   exact source SHA. It never invokes the vLLM build helper.
+
+Build and test jobs can run on different provisioned ARM64 agents; they do not
+share a filesystem. The test agent must match the recorded Python major/minor,
+Torch version (including the nightly/local version), CUDA major/minor and
+Windows architecture. Both jobs must use the same ci-infra commit. A mismatch
+fails before installing the wheel or running tests, rather than changing the
+agent's dependencies automatically. Build-only does not require a visible GPU,
+but still requires CUDA-enabled Torch and the compiler/toolkit configuration;
+the test job requires a working NVIDIA GPU.
+
+The test job creates a disposable test venv, makes the provisioned pool
+dependencies available through a `.pth`
 file, installs the [pytest harness](requirements-tests.txt), and installs the
 new wheel locally with its console scripts. No packages in the pool venv are
 replaced. The runner checks that vLLM imports from this job's installed wheel,
@@ -57,13 +79,23 @@ collection errors, and initialization errors fail the Buildkite job.
 This invokes the Python pytest tree, not upstream CI's separate shell scripts,
 Rust cargo tests, or a matrix of CUDA/ROCm/TPU machines.
 
-`artifacts\windows-arm64` contains `pytest.xml` and `pytest-summary.json` in
-addition to the wheel/provenance. The summary records collected tests, passes,
+The build job retains its wheel/provenance in `artifacts\windows-arm64`.
+The test job writes `pytest.xml` and `pytest-summary.json` to the separate
+`artifacts\windows-arm64-tests` directory, alongside a copy of the verified
+build manifest, producer reference, and test runtime. The summary records collected tests, passes,
 failures (including setup/teardown), skips, collection errors and the pytest
 exit code. If setup fails before pytest can produce results, its last phase
 remains in `pytest-summary.json` and the error is in the Buildkite log.
-The ARM64-only job has a 24-hour timeout including compilation and tests;
+Build and test have independent timeouts of 6 hours and 24 hours respectively;
 the combined pipeline's timeouts are unchanged.
+
+After a successful build, click **Run full ARM64 test suite** in Buildkite to
+release the test job. To retry failures, retry **Full pytest suite (arm64)**
+only, not the build job or the entire build. It downloads the saved wheel
+again and uses a fresh test checkout/venv. Artifact retention must cover the
+delay before testing. Deliberately retrying the producer build replaces its
+recorded artifact reference; ordinary test-only retries leave it unchanged.
+This split pipeline does not select artifacts from older Buildkite builds.
 
 **The smoke-test pool is not sufficient for every upstream test.** Full tests
 need compatible packages beyond the pytest harness, including model/audio/video
@@ -174,7 +206,7 @@ dependencies, adding only the test harness and newly built vLLM wheel locally.
 
 For the ARM64-only pipeline, create a self-hosted Buildkite queue named
 `windows-arm64` in the pipeline's cluster and give the pipeline access to it.
-The upload, source-resolution and build steps all run on this queue. The
+The upload, source-resolution, build and test jobs all run on this queue. The
 combined `windows.yml` pipeline also requires `windows-x64` in the same cluster;
 its source-resolution step runs on x64. For custom queue names, set
 `WINDOWS_ARM64_QUEUE` and, for the combined pipeline, `WINDOWS_X64_QUEUE`
@@ -544,14 +576,16 @@ accounts unprivileged and avoid production credentials.
 
 Each selected architecture uploads `artifacts/windows-<architecture>/**/*`: its wheel,
 SHA-256 checksum, source/ci-infra commit provenance, Python/Torch runtime
-metadata, and `smoke.json` on success. Compilation and failure output is in the
+metadata, and (for the combined pipeline) `smoke.json` on success.
+The ARM64-only build also uploads `build-manifest.json`; its separate test job
+uploads `artifacts/windows-arm64-tests/**/*`. Compilation and failure output is in the
 Buildkite job log. A wheel may be uploaded for diagnosis after a failed smoke
 test; only consume artifacts from a successful job.
 
 Run infrastructure tests (no CUDA needed):
 
 ```powershell
-python -m pytest buildkite\tests\test_windows_ci.py buildkite\tests\test_windows_provisioning.py buildkite\tests\test_windows_tool_discovery.py
+python -m pytest buildkite\tests\test_windows_ci.py buildkite\tests\test_windows_full_suite.py buildkite\tests\test_windows_artifact_handoff.py
 ```
 
 Native `.cmd` exit-code tests run on Windows and are skipped on other hosts.

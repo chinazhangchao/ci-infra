@@ -64,3 +64,5 @@ dist/
 # Native Windows CI wheel and smoke-test outputs
 artifacts/windows-x64/
 artifacts/windows-arm64/
+artifacts/windows-arm64-tests/
+artifacts/windows-x64-tests/

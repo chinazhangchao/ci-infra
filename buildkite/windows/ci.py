@@ -220,7 +220,15 @@ def git_longpaths_environment(env, work):
     return prepared
 
 
-def validate_wheel(output, architecture):
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_wheel(output, architecture, *, write_checksum=True):
     wheels = list(output.glob("*.whl"))
     platform = PLATFORMS[architecture]
     if len(wheels) != 1 or not wheels[0].name.endswith(f"-{platform}.whl"):
@@ -246,14 +254,206 @@ def validate_wheel(output, architecture):
                 "Wheel does not contain a compiled vLLM core extension "
                 "(_C or _C_stable_libtorch)."
             )
-    with wheel.open("rb") as stream:
-        digest = hashlib.sha256()
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    (output / f"{wheel.name}.sha256").write_text(
-        f"{digest.hexdigest()}  {wheel.name}\n", encoding="utf-8"
-    )
+    if write_checksum:
+        (output / f"{wheel.name}.sha256").write_text(
+            f"{sha256_file(wheel)}  {wheel.name}\n", encoding="utf-8"
+        )
     return wheel
+
+
+def probe_runtime(python, env, architecture, *, require_gpu=True):
+    runtime = json.loads(
+        run(
+            [
+                python,
+                "-I",
+                "-c",
+                (
+                    "import json, sys, sysconfig, torch, build; "
+                    "print(json.dumps(dict(platform=sysconfig.get_platform(), "
+                    "python=f'{sys.version_info.major}.{sys.version_info.minor}', "
+                    "torch=torch.__version__, cuda=torch.version.cuda, "
+                    "gpu_available=torch.cuda.is_available())))"
+                ),
+            ],
+            env=env,
+            capture=True,
+        )
+    )
+    if runtime["platform"].replace("-", "_") != PLATFORMS[architecture]:
+        raise ValueError(
+            f"The provisioned Python does not target {architecture}: {runtime}"
+        )
+    if not runtime["cuda"] or (require_gpu and not runtime["gpu_available"]):
+        raise ValueError(
+            f"CUDA-enabled PyTorch{' and a working NVIDIA GPU' if require_gpu else ''} required: {runtime}"
+        )
+    if architecture == "arm64" and runtime["cuda"] != "13.4":
+        raise ValueError(
+            "The fork's ARM64 helper requires PyTorch built for CUDA 13.4."
+        )
+    return runtime
+
+
+def checkout_source(source, source_info, env):
+    source.mkdir()
+    run(["git", "init", str(source)], env=env)
+    run(["git", "-C", source, "config", "core.longpaths", "true"], env=env)
+    run(["git", "-C", source, "remote", "add", "origin", REPOSITORY], env=env)
+    # setuptools-scm needs tags and history for the x64 wheel version.
+    run(
+        ["git", "-C", source, "fetch", "--tags", "origin", source_info["commit"]],
+        env=env,
+    )
+    run(["git", "-C", source, "checkout", "--detach", source_info["commit"]], env=env)
+    actual_commit = run(
+        ["git", "-C", source, "rev-parse", "HEAD"], env=env, capture=True
+    )
+    if actual_commit.lower() != source_info["commit"].lower():
+        raise ValueError(f"Checked out an unexpected source commit: {actual_commit}")
+    run(["git", "-C", source, "submodule", "update", "--init", "--recursive"], env=env)
+
+
+def publish_build_manifest(output, architecture, wheel, source_info, runtime, env):
+    producer = {
+        "build_id": required(env, "BUILDKITE_BUILD_ID"),
+        "job_id": required(env, "BUILDKITE_JOB_ID"),
+        "step_key": required(env, "BUILDKITE_STEP_KEY"),
+    }
+    manifest = {
+        "schema_version": 1,
+        "architecture": architecture,
+        "producer": producer,
+        "source": {**source_info, "ci_infra_commit": required(env, "BUILDKITE_COMMIT")},
+        "runtime": runtime,
+        "wheel": {"filename": wheel.name, "sha256": sha256_file(wheel)},
+    }
+    manifest_path = output / "build-manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    # The test job depends on successful completion, including automatic artifact
+    # upload. Pin the producer attempt so test retries cannot mix jobs' files.
+    reference = {**producer, "manifest_sha256": sha256_file(manifest_path)}
+    run(
+        [
+            "buildkite-agent",
+            "meta-data",
+            "set",
+            f"windows-wheel-{architecture}",
+            json.dumps(reference),
+        ],
+        env=env,
+    )
+
+
+def verify_build_artifacts(directory, architecture, reference, env):
+    manifest_path = directory / "build-manifest.json"
+    if sha256_file(manifest_path) != reference["manifest_sha256"]:
+        raise ValueError("Build manifest checksum does not match the producing job.")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if (
+        manifest.get("schema_version") != 1
+        or manifest.get("architecture") != architecture
+    ):
+        raise ValueError("Unsupported build manifest or wrong wheel architecture.")
+    producer = {key: reference[key] for key in ("build_id", "job_id", "step_key")}
+    if manifest.get("producer") != producer:
+        raise ValueError("Build manifest identifies a different producing job.")
+    source_info = validate_source(manifest["source"])
+    if source_info.get("ci_infra_commit") != required(env, "BUILDKITE_COMMIT"):
+        raise ValueError("Build and test jobs must use the same ci-infra commit.")
+    wheel_info = manifest["wheel"]
+    filename = wheel_info["filename"]
+    if not isinstance(filename, str) or not re.fullmatch(
+        r"[A-Za-z0-9_.+!-]+\.whl", filename
+    ):
+        raise ValueError("Invalid wheel filename in build manifest.")
+    wheel = directory / filename
+    checksum = wheel_info["sha256"]
+    if not isinstance(checksum, str) or not re.fullmatch(r"[0-9a-f]{64}", checksum):
+        raise ValueError("Invalid wheel checksum in build manifest.")
+    if sha256_file(wheel) != checksum:
+        raise ValueError("Wheel checksum does not match the producing job.")
+    expected = f"{checksum}  {filename}"
+    if (directory / f"{filename}.sha256").read_text(
+        encoding="utf-8"
+    ).strip() != expected:
+        raise ValueError("Wheel checksum sidecar disagrees with the build manifest.")
+    if validate_wheel(directory, architecture, write_checksum=False) != wheel:
+        raise ValueError("Unexpected wheel in downloaded build artifacts.")
+    return wheel, manifest
+
+
+def test_build(architecture):
+    if sys.platform != "win32":
+        raise RuntimeError("Windows CUDA tests must run on Windows agents.")
+    python, venv, env = build_environment(architecture, os.environ)
+    reference = json.loads(
+        run(
+            ["buildkite-agent", "meta-data", "get", f"windows-wheel-{architecture}"],
+            env=env,
+            capture=True,
+        )
+    )
+    if (
+        not isinstance(reference, dict)
+        or reference.get("build_id") != required(env, "BUILDKITE_BUILD_ID")
+        or reference.get("step_key") != f"windows-cuda-{architecture}"
+        or not isinstance(reference.get("job_id"), str)
+        or not reference["job_id"]
+        or not isinstance(reference.get("manifest_sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", reference["manifest_sha256"])
+    ):
+        raise ValueError(
+            "Invalid Windows wheel producer reference for this Buildkite build."
+        )
+    output = Path.cwd() / "artifacts" / f"windows-{architecture}-tests"
+    output.mkdir(parents=True, exist_ok=False)
+    (output / "producer.json").write_text(
+        json.dumps(reference, indent=2) + "\n", encoding="utf-8"
+    )
+    work_root = Path(required(env, "VLLM_WINDOWS_WORK_ROOT")).resolve()
+    work_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="vllm-test-", dir=work_root) as work:
+        work = Path(work)
+        env = git_longpaths_environment(env, work)
+        incoming = work / "download"
+        incoming.mkdir()
+        run(
+            [
+                "buildkite-agent",
+                "artifact",
+                "download",
+                f"artifacts/windows-{architecture}/*",
+                str(incoming),
+                "--build",
+                reference["build_id"],
+                "--step",
+                reference["job_id"],
+            ],
+            env=env,
+        )
+        wheel, manifest = verify_build_artifacts(
+            incoming / "artifacts" / f"windows-{architecture}",
+            architecture,
+            reference,
+            env,
+        )
+        (output / "build-manifest.json").write_text(
+            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+        )
+        runtime = probe_runtime(python, env, architecture)
+        for field in ("platform", "python", "torch", "cuda"):
+            expected = manifest["runtime"].get(field)
+            if not expected or runtime.get(field) != expected:
+                raise ValueError(
+                    f"Test runtime {field}={runtime.get(field)!r} does not match build {expected!r}."
+                )
+        (output / "runtime.json").write_text(
+            json.dumps(runtime, indent=2) + "\n", encoding="utf-8"
+        )
+        source = work / "src"
+        checkout_source(source, manifest["source"], env)
+        run_full_tests(python, venv, source, wheel, work, output, env)
 
 
 def run_full_tests(python, venv, source, wheel, work, output, env):
@@ -338,34 +538,7 @@ def build(architecture, test_suite="smoke"):
         + "\n",
         encoding="utf-8",
     )
-    probe = run(
-        [
-            python,
-            "-I",
-            "-c",
-            (
-                "import json, sysconfig, torch, build; "
-                "print(json.dumps(dict(platform=sysconfig.get_platform(), "
-                "torch=torch.__version__, cuda=torch.version.cuda, "
-                "gpu_available=torch.cuda.is_available())))"
-            ),
-        ],
-        env=env,
-        capture=True,
-    )
-    runtime = json.loads(probe)
-    if runtime["platform"].replace("-", "_") != PLATFORMS[architecture]:
-        raise ValueError(
-            f"The provisioned Python does not target {architecture}: {runtime}"
-        )
-    if not runtime["cuda"] or not runtime["gpu_available"]:
-        raise ValueError(
-            f"A CUDA-enabled PyTorch and a working NVIDIA GPU are required: {runtime}"
-        )
-    if architecture == "arm64" and runtime["cuda"] != "13.4":
-        raise ValueError(
-            "The fork's ARM64 helper requires PyTorch built for CUDA 13.4."
-        )
+    runtime = probe_runtime(python, env, architecture, require_gpu=test_suite != "none")
     (output / "runtime.json").write_text(
         json.dumps(runtime, indent=2) + "\n", encoding="utf-8"
     )
@@ -376,33 +549,15 @@ def build(architecture, test_suite="smoke"):
     with tempfile.TemporaryDirectory(prefix="vllm-", dir=work_root) as work:
         env = git_longpaths_environment(env, Path(work))
         source = Path(work) / "src"
-        source.mkdir()
-        run(["git", "init", str(source)], env=env)
-        run(["git", "-C", source, "config", "core.longpaths", "true"], env=env)
-        run(["git", "-C", source, "remote", "add", "origin", REPOSITORY], env=env)
-        # setuptools-scm needs tags and history for the x64 wheel version.
-        run(
-            ["git", "-C", source, "fetch", "--tags", "origin", source_info["commit"]],
-            env=env,
-        )
-        run(
-            ["git", "-C", source, "checkout", "--detach", source_info["commit"]],
-            env=env,
-        )
-        actual_commit = run(
-            ["git", "-C", source, "rev-parse", "HEAD"], env=env, capture=True
-        )
-        if actual_commit.lower() != source_info["commit"].lower():
-            raise ValueError(
-                f"Checked out an unexpected source commit: {actual_commit}"
-            )
-        run(
-            ["git", "-C", source, "submodule", "update", "--init", "--recursive"],
-            env=env,
-        )
+        checkout_source(source, source_info, env)
         command = build_command(architecture, source, python, venv, output, env)
         run(command, cwd=source, env=env)
         wheel = validate_wheel(output, architecture)
+        if test_suite == "none":
+            publish_build_manifest(
+                output, architecture, wheel, source_info, runtime, env
+            )
+            return
         if test_suite == "full":
             run_full_tests(python, venv, source, wheel, work, output, env)
             return
@@ -449,11 +604,15 @@ def main():
     build_parser = subcommands.add_parser("build")
     build_parser.add_argument("--architecture", choices=PLATFORMS, required=True)
     build_parser.add_argument(
-        "--test-suite", choices=["smoke", "full"], default="smoke"
+        "--test-suite", choices=["none", "smoke", "full"], default="smoke"
     )
+    test_parser = subcommands.add_parser("test")
+    test_parser.add_argument("--architecture", choices=PLATFORMS, required=True)
     args = parser.parse_args()
     if args.command == "resolve":
         resolve_source()
+    elif args.command == "test":
+        test_build(args.architecture)
     else:
         build(args.architecture, args.test_suite)
 
