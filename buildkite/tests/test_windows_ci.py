@@ -85,11 +85,15 @@ def test_pipeline_routes_selected_native_architectures(
         assert step["agents"] == {"queue": f"${{{variable}:-windows-{architecture}}}"}
         assert step["key"] == f"windows-cuda-{architecture}"
         assert step["depends_on"] == source["key"]
+        full_suite = filename == "windows-arm64.yml"
         assert step["command"] == (
             rf"python buildkite\windows\ci.py build --architecture {architecture}"
+            + (" --test-suite full" if full_suite else "")
         )
         assert step["artifact_paths"] == [f"artifacts/windows-{architecture}/**/*"]
-        assert step["timeout_in_minutes"] == {"x64": 240, "arm64": 360}[architecture]
+        assert step["timeout_in_minutes"] == (
+            1440 if full_suite else {"x64": 240, "arm64": 360}[architecture]
+        )
         assert step["retry"] == {"automatic": [{"exit_status": -1, "limit": 1}]}
         assert "plugins" not in step
         assert not step.get("soft_fail")
@@ -321,12 +325,15 @@ def test_build_environment_reaches_nested_git_checkouts(tmp_path_factory):
     inputs["PATH"] = env["PATH"]
     _, _, prepared = ci.build_environment("arm64", inputs)
     prepared = ci.git_longpaths_environment(prepared, tmp_path)
-    assert ci.run(
-        [git, "config", "--get", "test.preserved"],
-        cwd=workspace,
-        env=prepared,
-        capture=True,
-    ) == "original"
+    assert (
+        ci.run(
+            [git, "config", "--get", "test.preserved"],
+            cwd=workspace,
+            env=prepared,
+            capture=True,
+        )
+        == "original"
+    )
     for enabled, child_env in ((False, env), (True, prepared)):
         mode = "enabled" if enabled else "disabled"
         prefix = workspace / ".deps"
@@ -456,17 +463,29 @@ def test_wheel_rejects_non_core_extensions(tmp_path, extension_name):
     assert not list(tmp_path.glob("*.sha256"))
 
 
-@pytest.mark.parametrize("architecture", ["x64", "arm64"])
+@pytest.mark.parametrize(
+    "architecture,test_suite", [("x64", "smoke"), ("arm64", "smoke"), ("arm64", "full")]
+)
 @pytest.mark.parametrize(
     "failure", [None, "compile", "smoke", "wrong-python", "no-gpu", "wrong-source"]
 )
-def test_build_lifecycle(tmp_path, monkeypatch, architecture, failure):
+def test_build_lifecycle(tmp_path, monkeypatch, architecture, test_suite, failure):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(ci, "sys", SimpleNamespace(platform="win32"))
     env = provisioned_environment(tmp_path)
     prepared = ci.build_environment(architecture, env)
     monkeypatch.setattr(ci, "build_environment", lambda *args: prepared)
     monkeypatch.setattr(ci, "build_command", lambda *args: ["compile-wheel"])
+    full_calls = []
+
+    def full_tests(python, venv, source, wheel, work, output, env):
+        assert any(args == ["compile-wheel"] for args, _ in calls)
+        assert wheel.is_file()
+        full_calls.append(source)
+        if failure == "smoke":
+            raise subprocess.CalledProcessError(24, ["full-tests"])
+
+    monkeypatch.setattr(ci, "run_full_tests", full_tests)
     output = tmp_path / "artifacts" / f"windows-{architecture}"
     calls = []
 
@@ -498,21 +517,27 @@ def test_build_lifecycle(tmp_path, monkeypatch, architecture, failure):
     monkeypatch.setattr(ci, "run", run)
     if failure:
         with pytest.raises((subprocess.CalledProcessError, ValueError)):
-            ci.build(architecture)
+            ci.build(architecture, test_suite)
     else:
-        ci.build(architecture)
-        install = next(args for args, _ in calls if "install" in args)
-        assert "--target" in install and "--no-deps" in install
-        smoke_call, options = calls[-1]
-        assert "-I" in smoke_call
-        assert str(ci.HERE / "smoke.py") in smoke_call
-        assert options["cwd"] != tmp_path
-        assert not Path(options["cwd"]).exists()
+        ci.build(architecture, test_suite)
+        if test_suite == "smoke":
+            install = next(args for args, _ in calls if "install" in args)
+            assert "--target" in install and "--no-deps" in install
+            smoke_call, options = calls[-1]
+            assert "-I" in smoke_call
+            assert str(ci.HERE / "smoke.py") in smoke_call
+            assert options["cwd"] != tmp_path
+            assert not Path(options["cwd"]).exists()
+        else:
+            assert len(full_calls) == 1
+            assert not full_calls[0].exists()
+            assert not any(str(ci.HERE / "smoke.py") in args for args, _ in calls)
         fetch = next(args for args, _ in calls if "fetch" in args)
         assert fetch[-1] == SHA
         assert "--tags" in fetch and "--depth=1" not in fetch
     if failure in ("compile", "wrong-python", "no-gpu", "wrong-source"):
         assert not any(str(ci.HERE / "smoke.py") in args for args, _ in calls)
+        assert not full_calls
     for args, options in calls:
         if args[0] == "git" or args == ["compile-wheel"]:
             child_env = options["env"]
@@ -589,9 +614,7 @@ def test_smoke_loads_core_extension_and_runs_kernel(
             raise ImportError("Core extension DLL could not be loaded")
         return extension
 
-    find_spec = Mock(
-        return_value=object() if module == "_C_stable_libtorch" else None
-    )
+    find_spec = Mock(return_value=object() if module == "_C_stable_libtorch" else None)
     monkeypatch.setattr(
         smoke,
         "importlib",

@@ -408,6 +408,8 @@ print(json.dumps(dict(platform=sysconfig.get_platform(), torch=torch.__version__
         PROTOC_INCLUDE = $protoInclude
         CARGO_HOME = (Join-Path $root "cargo-cache")
     }
+    if ($wheels) { $settings.VLLM_WINDOWS_WHEELHOUSE = $wheels }
+    $settings.VLLM_WINDOWS_NO_INDEX = if ($NoIndex) { "1" } else { "0" }
     if ($Architecture -eq "x64") {
         $settings.VLLM_WINDOWS_VCVARSALL = $vcvars
     } else {

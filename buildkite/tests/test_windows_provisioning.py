@@ -441,6 +441,8 @@ $script:commands | ConvertTo-Json -Depth 5 |
     env = settings["environment"]
     assert Path(env["VLLM_WINDOWS_VENV"]) == pool / "venv"
     assert Path(env["VLLM_WINDOWS_WORK_ROOT"]) == pool / "work"
+    assert env["VLLM_WINDOWS_WHEELHOUSE"] == str(inputs)
+    assert env["VLLM_WINDOWS_NO_INDEX"] == ("1" if no_index else "0")
     assert Path(env["BUILDKITE_BUILD_PATH"]) == pool / "checkouts"
     assert "BUILDKITE_AGENT_TOKEN" not in env
     assert "PATH" not in env

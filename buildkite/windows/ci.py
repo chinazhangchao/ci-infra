@@ -256,7 +256,69 @@ def validate_wheel(output, architecture):
     return wheel
 
 
-def build(architecture):
+def run_full_tests(python, venv, source, wheel, work, output, env):
+    summary_path = output / "pytest-summary.json"
+    summary = {"suite": "full", "status": "preparing-test-environment"}
+    summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    test_venv = Path(work) / "test-venv"
+    run([python, "-I", "-m", "venv", test_venv], cwd=work, env=env)
+    test_python = test_venv / "Scripts" / "python.exe"
+    test_site = test_venv / "Lib" / "site-packages"
+    # Nested venv --system-site-packages would inherit the system Python, not
+    # the pool venv. Share only the pool's preinstalled dependencies, read-only.
+    (test_site / "pool-dependencies.pth").write_text(
+        str(venv / "Lib" / "site-packages") + "\n", encoding="utf-8"
+    )
+    test_env = dict(env)
+    test_env["VIRTUAL_ENV"] = str(test_venv)
+    test_env["PATH"] = str(test_python.parent) + os.pathsep + env["PATH"]
+    test_env.pop("PYTHONPATH", None)
+    test_env.pop("PYTEST_ADDOPTS", None)
+    install = [
+        test_python,
+        "-m",
+        "pip",
+        "--isolated",
+        "install",
+        "--only-binary=:all:",
+        "-r",
+        HERE / "requirements-tests.txt",
+    ]
+    if env.get("VLLM_WINDOWS_WHEELHOUSE"):
+        install += ["--find-links", env["VLLM_WINDOWS_WHEELHOUSE"]]
+    if env.get("VLLM_WINDOWS_NO_INDEX") == "1":
+        install += ["--no-index"]
+    run(install, cwd=work, env=test_env)
+    run(
+        [
+            test_python,
+            "-m",
+            "pip",
+            "--isolated",
+            "install",
+            "--no-deps",
+            "--ignore-installed",
+            wheel,
+        ],
+        cwd=work,
+        env=test_env,
+    )
+    run(
+        [
+            test_python,
+            "-I",
+            HERE / "run_tests.py",
+            "--source-dir",
+            source,
+            "--output",
+            output,
+        ],
+        cwd=source,
+        env=test_env,
+    )
+
+
+def build(architecture, test_suite="smoke"):
     if sys.platform != "win32":
         raise RuntimeError("Windows CUDA builds must run on Windows agents.")
     python, venv, env = build_environment(architecture, os.environ)
@@ -341,6 +403,9 @@ def build(architecture):
         command = build_command(architecture, source, python, venv, output, env)
         run(command, cwd=source, env=env)
         wheel = validate_wheel(output, architecture)
+        if test_suite == "full":
+            run_full_tests(python, venv, source, wheel, work, output, env)
+            return
         installed = Path(work) / "installed"
         # Do not replace vLLM or its dependencies in the pool's provisioned environment.
         run(
@@ -383,11 +448,14 @@ def main():
     subcommands.add_parser("resolve")
     build_parser = subcommands.add_parser("build")
     build_parser.add_argument("--architecture", choices=PLATFORMS, required=True)
+    build_parser.add_argument(
+        "--test-suite", choices=["smoke", "full"], default="smoke"
+    )
     args = parser.parse_args()
     if args.command == "resolve":
         resolve_source()
     else:
-        build(args.architecture)
+        build(args.architecture, args.test_suite)
 
 
 if __name__ == "__main__":

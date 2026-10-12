@@ -1,0 +1,9 @@
+# Harness for the fork's complete tests tree. Model/backend dependencies belong
+# in the pool runtime environment; missing dependencies remain test failures.
+pytest>=8,<10
+pytest-asyncio
+pytest-rerunfailures
+pytest-shard
+pytest-timeout
+pytest-cov
+tblib

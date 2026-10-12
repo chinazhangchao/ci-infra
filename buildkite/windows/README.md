@@ -8,8 +8,9 @@ Existing Linux pipelines and the Linux-oriented pipeline generator are unchanged
 
 For **ARM64 only**, upload
 [windows-arm64.yml](../../.buildkite/pipelines/windows-arm64.yml) instead.
-This preserves the combined pipeline's x64 settings and requires only an
-ARM64 queue and agent.
+It builds the wheel and attempts the **entire fork `tests` pytest tree,
+including optional tests**. This preserves the combined pipeline's smoke-test
+and x64 settings and requires only an ARM64 queue and agent.
 
 The resolver freezes the branch tip in Buildkite metadata once per build. Both
 architectures, including retries, fetch that same SHA into separate temporary
@@ -17,7 +18,8 @@ checkouts. x64 builds with MSVC; arm64 invokes the fork's
 `tools\build-win-arm64.ps1` rather than duplicating its CUDA overlays, compiler
 selection, and Rust/OpenSSL workarounds. Neither job uses a precompiled vLLM.
 
-Each build job produces a wheel, checks its platform tags and compiled extension,
+Each build job produces a wheel and checks its platform tags and compiled extension.
+The combined `windows.yml` pipeline then
 installs it into a temporary target **without changing the agent's Python
 environment**, and executes the wheel's CUDA `silu_and_mul` kernel against a
 PyTorch reference. A missing GPU, incorrect architecture, build failure, or
@@ -28,6 +30,60 @@ The core extension may be the fork's `_C_stable_libtorch.pyd` or the legacy
 `_C.pyd` (including Python-tagged filenames). The smoke test verifies that the
 loaded extension belongs to the newly installed wheel, records its module name
 in `smoke.json`, and runs `_C.silu_and_mul` for either layout.
+
+### Full ARM64 pytest suite
+
+`windows-arm64.yml` runs `ci.py build --architecture arm64 --test-suite full`
+instead of the one-kernel smoke test. After compilation, it creates a disposable
+test venv, makes the provisioned pool dependencies available through a `.pth`
+file, installs the [pytest harness](requirements-tests.txt), and installs the
+new wheel locally with its console scripts. No packages in the pool venv are
+replaced. The runner checks that vLLM imports from this job's installed wheel,
+not the source checkout or a cached vLLM. Child Python processes receive the
+same package/test paths.
+
+The effective pytest invocation is:
+
+```powershell
+pytest tests --optional --continue-on-collection-errors --maxfail=0 `
+    --import-mode=append -o addopts= -o pythonpath= -ra --junitxml=<artifacts>\pytest.xml
+```
+
+There are no directory/marker filters or automatic Windows-specific exclusions.
+Inherited `PYTEST_ADDOPTS` and configured `addopts` are cleared. Collection
+errors remain failures, but do not prevent otherwise collectable tests from
+running. The fork's own skip/xfail conditions still apply. Pytest failures,
+collection errors, and initialization errors fail the Buildkite job.
+This invokes the Python pytest tree, not upstream CI's separate shell scripts,
+Rust cargo tests, or a matrix of CUDA/ROCm/TPU machines.
+
+`artifacts\windows-arm64` contains `pytest.xml` and `pytest-summary.json` in
+addition to the wheel/provenance. The summary records collected tests, passes,
+failures (including setup/teardown), skips, collection errors and the pytest
+exit code. If setup fails before pytest can produce results, its last phase
+remains in `pytest-summary.json` and the error is in the Buildkite log.
+The ARM64-only job has a 24-hour timeout including compilation and tests;
+the combined pipeline's timeouts are unchanged.
+
+**The smoke-test pool is not sufficient for every upstream test.** Full tests
+need compatible packages beyond the pytest harness, including model/audio/video
+dependencies, TorchVision/TorchAudio, OpenCV, and backend-specific libraries.
+Use the selected fork's `requirements\test\cuda.in` as the dependency inventory,
+but do not install its Linux Torch/Numba pins blindly over the provisioned
+NVIDIA Torch. Supply compatible test dependencies in the pool's runtime
+manifest and wheelhouse. Tests may additionally need several GPUs, NCCL,
+Hugging Face access/credentials, large model storage, and external services.
+Some cannot run on Windows ARM64 at all. This pipeline deliberately attempts
+the full tree and reports those incompatibilities; it does not claim that
+every test can execute successfully on one ARM64 machine. A root `conftest.py`
+import failure can prevent collection entirely and is a failure, not a skip.
+
+Newly provisioned agents carry `VLLM_WINDOWS_WHEELHOUSE` and
+`VLLM_WINDOWS_NO_INDEX` from the provisioning arguments. Full-test harness
+installation uses that wheelhouse and respects `NoIndex`. For an existing pool,
+set these variables in the trusted agent environment before restarting its
+launcher if they are not in `environment.json` yet. With `NoIndex=1`, include
+the harness wheels and their dependencies in the wheelhouse.
 
 ## Provision the private pools
 
@@ -113,6 +169,8 @@ Both Windows architectures default to **Python 3.13**. The pool creates
 packages, and checks that it is a real venv with the expected Python version
 and architecture **before** installing dependencies. Builds and smoke tests use
 that venv's `Scripts\python.exe`; you do not need to activate it manually.
+Full-suite jobs use a disposable child venv with the same interpreter and pool
+dependencies, adding only the test harness and newly built vLLM wheel locally.
 
 For the ARM64-only pipeline, create a self-hosted Buildkite queue named
 `windows-arm64` in the pipeline's cluster and give the pipeline access to it.
@@ -305,8 +363,8 @@ a matching wheel, provisioning stops with pip's missing-distribution or
 dependency-conflict error. A project being listed on PyPI does not mean it has
 a wheel for the pinned version and Windows ARM64.
 OpenCV headless and the `mistral-common[image]` extra that pulls
-it in are omitted from this CI profile; OpenCV-dependent image/video features
-require a separate optional installation. TileLang and
+it in are omitted from the default runtime profile; OpenCV-dependent image/video features
+and full-suite tests require additional compatible dependencies. TileLang and
 InstantTensor are optional acceleration/model-loading backends with no public
 Windows ARM64 wheels and are omitted from this build/kernel-smoke CI profile.
 The fork's x64-only dependencies are also excluded. This is not a claim of
