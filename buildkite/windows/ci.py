@@ -238,8 +238,14 @@ def validate_wheel(output, architecture):
         ]
         if not tags or any(tag.rsplit("-", 1)[-1] != platform for tag in tags):
             raise ValueError(f"Wheel metadata does not target {platform}: {tags}")
-        if not any(re.fullmatch(r"vllm/_C(?:\.[^/]+)?\.pyd", name) for name in members):
-            raise ValueError("Wheel does not contain the compiled vllm._C extension.")
+        if not any(
+            re.fullmatch(r"vllm/_C(?:_stable_libtorch)?(?:\.[^/]+)?\.pyd", name)
+            for name in members
+        ):
+            raise ValueError(
+                "Wheel does not contain a compiled vLLM core extension "
+                "(_C or _C_stable_libtorch)."
+            )
     with wheel.open("rb") as stream:
         digest = hashlib.sha256()
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):

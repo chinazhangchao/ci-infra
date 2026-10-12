@@ -7,7 +7,7 @@ import sys
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 import yaml
@@ -19,7 +19,9 @@ SHA = "a" * 40
 SOURCE = {"repository": ci.REPOSITORY, "branch": ci.DEFAULT_BRANCH, "commit": SHA}
 
 
-def make_wheel(directory, architecture="x64", *, tag=None, extension=True):
+def make_wheel(
+    directory, architecture="x64", *, tag=None, extension=True, extension_name="_C"
+):
     platform = ci.PLATFORMS[architecture]
     wheel = directory / f"vllm-0.29.0-cp313-cp313-{platform}.whl"
     with zipfile.ZipFile(wheel, "w") as archive:
@@ -28,7 +30,7 @@ def make_wheel(directory, architecture="x64", *, tag=None, extension=True):
             f"Wheel-Version: 1.0\nTag: {tag or f'cp313-cp313-{platform}'}\n",
         )
         if extension:
-            archive.writestr("vllm/_C.pyd", b"test extension")
+            archive.writestr(f"vllm/{extension_name}.pyd", b"test extension")
     return wheel
 
 
@@ -408,8 +410,13 @@ def test_arm64_reuses_fork_helper_without_skipping_build(tmp_path):
 
 
 @pytest.mark.parametrize("architecture", ["x64", "arm64"])
-def test_wheel_architecture_and_checksum(tmp_path, architecture):
-    wheel = make_wheel(tmp_path, architecture)
+@pytest.mark.parametrize("module", ["_C", "_C_stable_libtorch"])
+@pytest.mark.parametrize("tagged", [False, True])
+def test_wheel_architecture_and_checksum(tmp_path, architecture, module, tagged):
+    extension_name = (
+        f"{module}.cp313-{ci.PLATFORMS[architecture]}" if tagged else module
+    )
+    wheel = make_wheel(tmp_path, architecture, extension_name=extension_name)
     assert ci.validate_wheel(tmp_path, architecture) == wheel
     assert (tmp_path / f"{wheel.name}.sha256").read_text() == (
         f"{hashlib.sha256(wheel.read_bytes()).hexdigest()}  {wheel.name}\n"
@@ -431,6 +438,22 @@ def test_invalid_wheel_outputs_fail(tmp_path, problem):
         make_wheel(tmp_path, extension=False)
     with pytest.raises(ValueError):
         ci.validate_wheel(tmp_path, "x64")
+
+
+@pytest.mark.parametrize(
+    "extension_name",
+    [
+        "_C_stable_libtorch_extra",
+        "_moe_C_stable_libtorch",
+        "_rust_tool_parser",
+        "vllm_flash_attn/_vllm_fa2_C",
+    ],
+)
+def test_wheel_rejects_non_core_extensions(tmp_path, extension_name):
+    make_wheel(tmp_path, "arm64", extension_name=extension_name)
+    with pytest.raises(ValueError, match="compiled vLLM core extension"):
+        ci.validate_wheel(tmp_path, "arm64")
+    assert not list(tmp_path.glob("*.sha256"))
 
 
 @pytest.mark.parametrize("architecture", ["x64", "arm64"])
@@ -542,6 +565,84 @@ def test_smoke_does_not_accept_cached_package_or_missing_gpu(
         RuntimeError, match="outside" if cached_package else "CUDA is not available"
     ):
         smoke.smoke(package, "x64")
+
+
+@pytest.mark.parametrize("module", ["_C", "_C_stable_libtorch"])
+@pytest.mark.parametrize("failure", [None, "cached", "load-error"])
+def test_smoke_loads_core_extension_and_runs_kernel(
+    tmp_path, monkeypatch, module, failure
+):
+    monkeypatch.setattr(smoke, "sys", SimpleNamespace(platform="win32", path=[]))
+    monkeypatch.setattr(smoke.sysconfig, "get_platform", lambda: "win-arm64")
+    package = tmp_path / "installed"
+    extension_name = f"vllm.{module}"
+    origin = tmp_path / "cached" if failure == "cached" else package
+    extension = SimpleNamespace(__file__=str(origin / "vllm" / f"{module}.pyd"))
+    imports = []
+
+    def import_module(name):
+        imports.append(name)
+        if name == "vllm._custom_ops":
+            return SimpleNamespace()
+        assert name == extension_name
+        if failure == "load-error":
+            raise ImportError("Core extension DLL could not be loaded")
+        return extension
+
+    find_spec = Mock(
+        return_value=object() if module == "_C_stable_libtorch" else None
+    )
+    monkeypatch.setattr(
+        smoke,
+        "importlib",
+        SimpleNamespace(
+            import_module=import_module,
+            util=SimpleNamespace(find_spec=find_spec),
+        ),
+    )
+    x = MagicMock(dtype="float32", device="cuda")
+    output = object()
+    kernel = Mock()
+    torch = SimpleNamespace(
+        __version__="test-torch",
+        version=SimpleNamespace(cuda="13.4"),
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            synchronize=Mock(),
+            get_device_name=lambda index: "test GPU",
+        ),
+        float32="float32",
+        manual_seed=Mock(),
+        inference_mode=MagicMock(),
+        randn=Mock(return_value=x),
+        empty=Mock(return_value=output),
+        ops=SimpleNamespace(_C=SimpleNamespace(silu_and_mul=kernel)),
+        nn=SimpleNamespace(functional=SimpleNamespace(silu=MagicMock())),
+        testing=SimpleNamespace(assert_close=Mock()),
+    )
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm",
+        SimpleNamespace(
+            __file__=str(package / "vllm" / "__init__.py"),
+            __version__="test-vllm",
+        ),
+    )
+    if failure:
+        error = RuntimeError if failure == "cached" else ImportError
+        with pytest.raises(error, match="cached|could not be loaded"):
+            smoke.smoke(package, "arm64")
+        kernel.assert_not_called()
+    else:
+        result = smoke.smoke(package, "arm64")
+        assert result["extension"] == extension_name
+        assert result["kernel"] == "_C.silu_and_mul"
+        assert result["status"] == "passed"
+        kernel.assert_called_once_with(output, x)
+        torch.cuda.synchronize.assert_called_once()
+        torch.testing.assert_close.assert_called_once()
+    assert imports == ["vllm._custom_ops", extension_name]
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Exercises native cmd.exe")

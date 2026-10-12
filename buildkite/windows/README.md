@@ -24,6 +24,10 @@ PyTorch reference. A missing GPU, incorrect architecture, build failure, or
 smoke-test failure fails the job; there is no CPU fallback or configure-only
 success. This is build and kernel smoke coverage, not the full Linux test suite
 or an end-to-end model inference test.
+The core extension may be the fork's `_C_stable_libtorch.pyd` or the legacy
+`_C.pyd` (including Python-tagged filenames). The smoke test verifies that the
+loaded extension belongs to the newly installed wheel, records its module name
+in `smoke.json`, and runs `_C.silu_and_mul` for either layout.
 
 ## Provision the private pools
 

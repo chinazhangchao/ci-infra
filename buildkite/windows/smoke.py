@@ -2,6 +2,7 @@
 
 import argparse
 import importlib
+import importlib.util
 import json
 import sys
 import sysconfig
@@ -24,7 +25,12 @@ def smoke(package_dir, architecture):
         raise RuntimeError("CUDA is not available; the smoke test cannot be skipped.")
 
     importlib.import_module("vllm._custom_ops")
-    extension = importlib.import_module("vllm._C")
+    extension_name = (
+        "vllm._C_stable_libtorch"
+        if importlib.util.find_spec("vllm._C_stable_libtorch") is not None
+        else "vllm._C"
+    )
+    extension = importlib.import_module(extension_name)
     if not Path(extension.__file__).resolve().is_relative_to(package_dir):
         raise RuntimeError("Smoke test loaded a cached vLLM CUDA extension.")
     torch.manual_seed(0)
@@ -41,6 +47,7 @@ def smoke(package_dir, architecture):
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
         "gpu": torch.cuda.get_device_name(0),
+        "extension": extension_name,
         "kernel": "_C.silu_and_mul",
         "status": "passed",
     }
