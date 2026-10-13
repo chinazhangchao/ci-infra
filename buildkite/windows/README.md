@@ -68,7 +68,7 @@ The effective pytest invocation is:
 
 ```powershell
 pytest tests --optional --continue-on-collection-errors --maxfail=0 `
-    --import-mode=append -o addopts= -o pythonpath= -ra --junitxml=<artifacts>\pytest.xml
+    --import-mode=append -o addopts= -o pythonpath= --tb=short -ra --junitxml=<artifacts>\pytest.xml
 ```
 
 There are no directory/marker filters or automatic Windows-specific exclusions.
@@ -80,12 +80,29 @@ This invokes the Python pytest tree, not upstream CI's separate shell scripts,
 Rust cargo tests, or a matrix of CUDA/ROCm/TPU machines.
 
 The build job retains its wheel/provenance in `artifacts\windows-arm64`.
-The test job writes `pytest.xml` and `pytest-summary.json` to the separate
-`artifacts\windows-arm64-tests` directory, alongside a copy of the verified
-build manifest, producer reference, and test runtime. The summary records collected tests, passes,
-failures (including setup/teardown), skips, collection errors and the pytest
-exit code. If setup fails before pytest can produce results, its last phase
-remains in `pytest-summary.json` and the error is in the Buildkite log.
+The test job writes reports to the separate `artifacts\windows-arm64-tests`
+directory, alongside a copy of the verified build manifest, producer reference,
+and test runtime:
+
+- `pytest-summary.json` is checkpointed during collection and test execution.
+  It records collected/completed tests, passes, failed reports (including
+  setup/teardown), skips, collection errors, the active test and the final
+  pytest exit code.
+- `pytest-failures.jsonl` is appended and closed after each failure, preserving
+  the node ID, phase, traceback and captured stdout/stderr/log sections.
+  It is created only when failures occur. Collection and test failures also
+  print immediately in the Buildkite log, rather than waiting for the full
+  suite to end.
+- `pytest.xml` is the normal JUnit report, produced when pytest finishes.
+
+If pytest is terminated before it can finalize, the last summary and previously
+written failures remain on disk even when JUnit is missing. A summary with
+`status: running` and `exit_code: null` is an incomplete run, **not a pass**;
+`active_test` identifies the last test started. Normal artifact upload still
+requires the Buildkite agent to survive the job; losing the machine may also
+lose local files. If environment setup fails before the runner starts, the
+preparation status remains in `pytest-summary.json` and the error is in the
+Buildkite log.
 Build and test have independent timeouts of 6 hours and 24 hours respectively;
 the combined pipeline's timeouts are unchanged.
 
