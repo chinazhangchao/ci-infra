@@ -107,7 +107,9 @@ Build and test have independent timeouts of 6 hours and 24 hours respectively;
 the combined pipeline's timeouts are unchanged.
 
 After a successful build, click **Run full ARM64 test suite** in Buildkite to
-release the test job. To retry failures, retry **Full pytest suite (arm64)**
+release the test job. Automatic Buildkite retries are disabled for the full-test
+job, including agent-loss failures; the build job's one-time infrastructure
+retry is unchanged. To retry failures manually, retry **Full pytest suite (arm64)**
 only, not the build job or the entire build. It downloads the saved wheel
 again and uses a fresh test checkout/venv. Artifact retention must cover the
 delay before testing. Deliberately retrying the producer build replaces its

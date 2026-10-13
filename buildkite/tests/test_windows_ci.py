@@ -112,6 +112,7 @@ def test_pipeline_routes_selected_native_architectures(
         assert test["agents"] == builds[0]["agents"]
         assert test["timeout_in_minutes"] == 1440
         assert test["artifact_paths"] == ["artifacts/windows-arm64-tests/**/*"]
+        assert test["retry"] == {"automatic": False}
         assert not test.get("soft_fail")
     else:
         assert len(steps) == 2

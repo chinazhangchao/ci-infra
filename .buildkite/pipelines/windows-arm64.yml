@@ -38,6 +38,4 @@ steps:
       - "artifacts/windows-arm64-tests/**/*"
     timeout_in_minutes: 1440
     retry:
-      automatic:
-        - exit_status: -1
-          limit: 1
+      automatic: false
