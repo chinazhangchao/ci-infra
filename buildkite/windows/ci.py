@@ -16,6 +16,7 @@ DEFAULT_BRANCH = "v029_win_arm64"
 SOURCE_KEY = "windows-vllm-source"
 HERE = Path(__file__).resolve().parent
 PLATFORMS = {"x64": "win_amd64", "arm64": "win_arm64"}
+TEST_BUILD_ID_ENV = "VLLM_WINDOWS_TEST_BUILD_ID"
 ARM64_OPTIONS = {
     "VLLM_WINDOWS_VS_PATH": "VisualStudioPath",
     "VLLM_WINDOWS_MSVC_VERSION": "MsvcToolsetVersion",
@@ -345,7 +346,9 @@ def publish_build_manifest(output, architecture, wheel, source_info, runtime, en
     )
 
 
-def verify_build_artifacts(directory, architecture, reference, env):
+def verify_build_artifacts(
+    directory, architecture, reference, env, *, allow_updated_runner=False
+):
     manifest_path = directory / "build-manifest.json"
     if sha256_file(manifest_path) != reference["manifest_sha256"]:
         raise ValueError("Build manifest checksum does not match the producing job.")
@@ -359,7 +362,12 @@ def verify_build_artifacts(directory, architecture, reference, env):
     if manifest.get("producer") != producer:
         raise ValueError("Build manifest identifies a different producing job.")
     source_info = validate_source(manifest["source"])
-    if source_info.get("ci_infra_commit") != required(env, "BUILDKITE_COMMIT"):
+    build_commit = source_info.get("ci_infra_commit")
+    if not isinstance(build_commit, str) or not re.fullmatch(
+        r"[0-9a-fA-F]{40}", build_commit
+    ):
+        raise ValueError("Build manifest has no valid ci-infra commit.")
+    if not allow_updated_runner and build_commit != required(env, "BUILDKITE_COMMIT"):
         raise ValueError("Build and test jobs must use the same ci-infra commit.")
     wheel_info = manifest["wheel"]
     filename = wheel_info["filename"]
@@ -383,20 +391,42 @@ def verify_build_artifacts(directory, architecture, reference, env):
     return wheel, manifest
 
 
-def test_build(architecture):
+def test_build(architecture, source_build_id=None):
     if sys.platform != "win32":
         raise RuntimeError("Windows CUDA tests must run on Windows agents.")
     python, venv, env = build_environment(architecture, os.environ)
+    if source_build_id is None:
+        source_build_id = env.get(TEST_BUILD_ID_ENV)
+    if source_build_id and not re.fullmatch(
+        r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", source_build_id
+    ):
+        raise ValueError(
+            f"{TEST_BUILD_ID_ENV}/--source-build-id must be the producer's "
+            "BUILDKITE_BUILD_ID UUID, not its build number or URL."
+        )
+    requested_build = source_build_id or required(env, "BUILDKITE_BUILD_ID")
+    metadata_args = [
+        "buildkite-agent",
+        "meta-data",
+        "get",
+        f"windows-wheel-{architecture}",
+    ]
+    if source_build_id:
+        metadata_args += ["--build", source_build_id]
+        print(
+            f"Testing wheel artifacts from Buildkite build {source_build_id}; no compilation.",
+            flush=True,
+        )
     reference = json.loads(
         run(
-            ["buildkite-agent", "meta-data", "get", f"windows-wheel-{architecture}"],
+            metadata_args,
             env=env,
             capture=True,
         )
     )
     if (
         not isinstance(reference, dict)
-        or reference.get("build_id") != required(env, "BUILDKITE_BUILD_ID")
+        or reference.get("build_id") != requested_build
         or reference.get("step_key") != f"windows-cuda-{architecture}"
         or not isinstance(reference.get("job_id"), str)
         or not reference["job_id"]
@@ -404,12 +434,24 @@ def test_build(architecture):
         or not re.fullmatch(r"[0-9a-f]{64}", reference["manifest_sha256"])
     ):
         raise ValueError(
-            "Invalid Windows wheel producer reference for this Buildkite build."
+            f"Invalid Windows wheel producer reference for Buildkite build {requested_build}."
         )
     output = Path.cwd() / "artifacts" / f"windows-{architecture}-tests"
     output.mkdir(parents=True, exist_ok=False)
     (output / "producer.json").write_text(
         json.dumps(reference, indent=2) + "\n", encoding="utf-8"
+    )
+    (output / "test-run.json").write_text(
+        json.dumps(
+            {
+                "build_id": required(env, "BUILDKITE_BUILD_ID"),
+                "ci_infra_commit": required(env, "BUILDKITE_COMMIT"),
+                "source_build_id": requested_build,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
     )
     work_root = Path(required(env, "VLLM_WINDOWS_WORK_ROOT")).resolve()
     work_root.mkdir(parents=True, exist_ok=True)
@@ -437,6 +479,7 @@ def test_build(architecture):
             architecture,
             reference,
             env,
+            allow_updated_runner=bool(source_build_id),
         )
         (output / "build-manifest.json").write_text(
             json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
@@ -608,11 +651,15 @@ def main():
     )
     test_parser = subcommands.add_parser("test")
     test_parser.add_argument("--architecture", choices=PLATFORMS, required=True)
+    test_parser.add_argument(
+        "--source-build-id",
+        help=f"Reuse a previous Buildkite build's artifacts (also via {TEST_BUILD_ID_ENV}).",
+    )
     args = parser.parse_args()
     if args.command == "resolve":
         resolve_source()
     elif args.command == "test":
-        test_build(args.architecture)
+        test_build(args.architecture, args.source_build_id)
     else:
         build(args.architecture, args.test_suite)
 

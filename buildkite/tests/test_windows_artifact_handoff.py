@@ -15,6 +15,8 @@ from buildkite.tests.test_windows_ci import (
 )
 from buildkite.windows import ci
 
+SOURCE_BUILD_ID = "0199aaaa-bbbb-7ccc-8ddd-eeeeeeeeeeee"
+
 
 @pytest.fixture
 def built_artifacts(tmp_path, monkeypatch):
@@ -176,10 +178,19 @@ def test_build_only_never_installs_or_runs_tests(tmp_path, monkeypatch, gpu_avai
         "wrong-build",
     ],
 )
+@pytest.mark.parametrize("source_mode", ["same-build", "argument", "environment"])
 def test_test_job_downloads_exact_producer_and_never_compiles(
-    tmp_path, monkeypatch, built_artifacts, failure
+    tmp_path, monkeypatch, built_artifacts, failure, source_mode
 ):
     directory, wheel, build_env, runtime, reference = built_artifacts
+    cross_build = source_mode != "same-build"
+    if cross_build:
+        reference["build_id"] = SOURCE_BUILD_ID
+        manifest_path = directory / "build-manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["producer"]["build_id"] = SOURCE_BUILD_ID
+        manifest_path.write_text(json.dumps(manifest))
+        reference["manifest_sha256"] = ci.sha256_file(manifest_path)
     checkout = tmp_path / "separate-agent-checkout"
     checkout.mkdir()
     monkeypatch.chdir(checkout)
@@ -187,6 +198,11 @@ def test_test_job_downloads_exact_producer_and_never_compiles(
     env = {**provisioned_environment(checkout), **build_env}
     env["BUILDKITE_JOB_ID"] = "test-job"
     env["BUILDKITE_STEP_KEY"] = "windows-tests-arm64"
+    if cross_build:
+        env["BUILDKITE_BUILD_ID"] = "test-only-build"
+        env["BUILDKITE_COMMIT"] = "d" * 40
+    if source_mode == "environment":
+        env[ci.TEST_BUILD_ID_ENV] = SOURCE_BUILD_ID
     prepared = ci.build_environment("arm64", env)
     monkeypatch.setattr(ci, "build_environment", lambda *args: prepared)
     monkeypatch.setattr(
@@ -202,11 +218,14 @@ def test_test_job_downloads_exact_producer_and_never_compiles(
         calls.append(args)
         if args[:3] == ["buildkite-agent", "meta-data", "get"]:
             assert args[3] == "windows-wheel-arm64"
+            assert args[4:] == (["--build", SOURCE_BUILD_ID] if cross_build else [])
             return json.dumps(reference)
         if args[:3] == ["buildkite-agent", "artifact", "download"]:
             assert args[3] == "artifacts/windows-arm64/*"
             assert args[args.index("--step") + 1] == "producer-attempt-2"
-            assert args[args.index("--build") + 1] == "build-1"
+            assert args[args.index("--build") + 1] == (
+                SOURCE_BUILD_ID if cross_build else "build-1"
+            )
             if failure == "download":
                 raise subprocess.CalledProcessError(2, args)
             target = Path(args[4]) / "artifacts" / "windows-arm64"
@@ -233,11 +252,12 @@ def test_test_job_downloads_exact_producer_and_never_compiles(
 
     monkeypatch.setattr(ci, "run", run)
     monkeypatch.setattr(ci, "run_full_tests", full_tests)
+    source_argument = SOURCE_BUILD_ID if source_mode == "argument" else None
     if failure:
         with pytest.raises((ValueError, subprocess.CalledProcessError)):
-            ci.test_build("arm64")
+            ci.test_build("arm64", source_argument)
     else:
-        ci.test_build("arm64")
+        ci.test_build("arm64", source_argument)
         assert len(full_calls) == 1
         assert not full_calls[0].exists()
         fetch = next(args for args in calls if "fetch" in args)
@@ -245,12 +265,22 @@ def test_test_job_downloads_exact_producer_and_never_compiles(
         assert (
             checkout / "artifacts" / "windows-arm64-tests" / "build-manifest.json"
         ).is_file()
+        execution = json.loads(
+            (
+                checkout / "artifacts" / "windows-arm64-tests" / "test-run.json"
+            ).read_text()
+        )
+        assert execution == {
+            "build_id": env["BUILDKITE_BUILD_ID"],
+            "ci_infra_commit": env["BUILDKITE_COMMIT"],
+            "source_build_id": SOURCE_BUILD_ID if cross_build else "build-1",
+        }
         # A retry can land on another agent with no previous checkout or wheel.
         checkout = tmp_path / "retry-agent-checkout"
         checkout.mkdir()
         monkeypatch.chdir(checkout)
         prepared[2]["VLLM_WINDOWS_WORK_ROOT"] = str(checkout / "work")
-        ci.test_build("arm64")
+        ci.test_build("arm64", source_argument)
         assert len(full_calls) == 2
         assert full_calls[0] != full_calls[1]
         assert not full_calls[1].exists()
@@ -278,7 +308,11 @@ def test_test_job_downloads_exact_producer_and_never_compiles(
             ["build", "--architecture", "arm64", "--test-suite", "none"],
             ("arm64", "none"),
         ),
-        (["test", "--architecture", "arm64"], ("arm64",)),
+        (["test", "--architecture", "arm64"], ("arm64", None)),
+        (
+            ["test", "--architecture", "arm64", "--source-build-id", SOURCE_BUILD_ID],
+            ("arm64", SOURCE_BUILD_ID),
+        ),
         (["build", "--architecture", "x64"], ("x64", "smoke")),
     ],
 )
@@ -291,3 +325,57 @@ def test_cli_dispatches_independent_jobs(monkeypatch, arguments, expected):
     ci.main()
     (test if arguments[0] == "test" else build).assert_called_once_with(*expected)
     (build if arguments[0] == "test" else test).assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "source_id",
+    ["8", "#8", "https://buildkite.com/org/pipeline/builds/8", " ", "--other"],
+)
+def test_source_build_id_requires_uuid(tmp_path, monkeypatch, source_id):
+    monkeypatch.setattr(ci, "sys", SimpleNamespace(platform="win32"))
+    prepared = ci.build_environment("arm64", provisioned_environment(tmp_path))
+    monkeypatch.setattr(ci, "build_environment", lambda *args: prepared)
+    runner = Mock(
+        side_effect=AssertionError("Invalid source ID must not trigger remote requests")
+    )
+    monkeypatch.setattr(ci, "run", runner)
+    with pytest.raises(ValueError, match="UUID, not its build number or URL"):
+        ci.test_build("arm64", source_id)
+    runner.assert_not_called()
+
+
+def test_cross_build_metadata_failure_does_not_fall_back(tmp_path, monkeypatch):
+    monkeypatch.setattr(ci, "sys", SimpleNamespace(platform="win32"))
+    prepared = ci.build_environment("arm64", provisioned_environment(tmp_path))
+    monkeypatch.setattr(ci, "build_environment", lambda *args: prepared)
+    runner = Mock(side_effect=subprocess.CalledProcessError(1, ["meta-data", "get"]))
+    monkeypatch.setattr(ci, "run", runner)
+    with pytest.raises(subprocess.CalledProcessError):
+        ci.test_build("arm64", SOURCE_BUILD_ID)
+    runner.assert_called_once_with(
+        [
+            "buildkite-agent",
+            "meta-data",
+            "get",
+            "windows-wheel-arm64",
+            "--build",
+            SOURCE_BUILD_ID,
+        ],
+        env=prepared[2],
+        capture=True,
+    )
+
+
+def test_explicit_source_build_overrides_environment(tmp_path, monkeypatch):
+    monkeypatch.setattr(ci, "sys", SimpleNamespace(platform="win32"))
+    env = provisioned_environment(tmp_path)
+    env[ci.TEST_BUILD_ID_ENV] = "0199ffff-bbbb-7ccc-8ddd-eeeeeeeeeeee"
+    prepared = ci.build_environment("arm64", env)
+    monkeypatch.setattr(ci, "build_environment", lambda *args: prepared)
+    runner = Mock(
+        side_effect=subprocess.CalledProcessError(1, ["stop-after-source-selection"])
+    )
+    monkeypatch.setattr(ci, "run", runner)
+    with pytest.raises(subprocess.CalledProcessError):
+        ci.test_build("arm64", SOURCE_BUILD_ID)
+    assert runner.call_args.args[0][-1] == SOURCE_BUILD_ID

@@ -100,6 +100,13 @@ def test_pipeline_routes_selected_native_architectures(
     if filename == "windows-arm64.yml":
         assert len(steps) == 3
         approval, test = steps[1:]
+        build_condition = (
+            'build.env("VLLM_WINDOWS_TEST_BUILD_ID") == null || '
+            'build.env("VLLM_WINDOWS_TEST_BUILD_ID") == ""'
+        )
+        for build_step in (source, builds[0], approval):
+            assert build_step["if"] == build_condition
+        assert "if" not in test
         assert approval["key"] == "windows-arm64-test-approval"
         assert approval["depends_on"] == "windows-cuda-arm64"
         assert "block" in approval
@@ -116,6 +123,7 @@ def test_pipeline_routes_selected_native_architectures(
         assert not test.get("soft_fail")
     else:
         assert len(steps) == 2
+        assert all("if" not in step for step in (source, *steps))
 
 
 def test_resolve_pins_branch_once(monkeypatch):

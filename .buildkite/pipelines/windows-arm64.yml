@@ -1,7 +1,9 @@
 # ARM64-only entrypoint; windows.yml retains the combined x64/ARM64 pipeline.
+# Set VLLM_WINDOWS_TEST_BUILD_ID on a new build to test a previous build's wheel.
 steps:
   - label: ":windows: Resolve vLLM source"
     key: windows-source
+    if: 'build.env("VLLM_WINDOWS_TEST_BUILD_ID") == null || build.env("VLLM_WINDOWS_TEST_BUILD_ID") == ""'
     agents:
       queue: "${WINDOWS_ARM64_QUEUE:-windows-arm64}"
     command: 'python buildkite\windows\ci.py resolve'
@@ -9,6 +11,7 @@ steps:
 
   - label: ":windows: Build CUDA wheel (arm64)"
     key: windows-cuda-arm64
+    if: 'build.env("VLLM_WINDOWS_TEST_BUILD_ID") == null || build.env("VLLM_WINDOWS_TEST_BUILD_ID") == ""'
     depends_on: windows-source
     agents:
       queue: "${WINDOWS_ARM64_QUEUE:-windows-arm64}"
@@ -23,6 +26,7 @@ steps:
 
   - block: ":pytest: Run full ARM64 test suite"
     key: windows-arm64-test-approval
+    if: 'build.env("VLLM_WINDOWS_TEST_BUILD_ID") == null || build.env("VLLM_WINDOWS_TEST_BUILD_ID") == ""'
     depends_on: windows-cuda-arm64
     prompt: "The wheel is built. Start the full vLLM test suite using this build's wheel?"
 

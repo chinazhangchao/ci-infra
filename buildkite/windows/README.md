@@ -50,7 +50,10 @@ in `smoke.json`, and runs `_C.silu_and_mul` for either layout.
 Build and test jobs can run on different provisioned ARM64 agents; they do not
 share a filesystem. The test agent must match the recorded Python major/minor,
 Torch version (including the nightly/local version), CUDA major/minor and
-Windows architecture. Both jobs must use the same ci-infra commit. A mismatch
+Windows architecture. In the default same-build mode, both jobs must use the
+same ci-infra commit. An explicitly requested previous build can be tested
+with an updated ci-infra runner, while still using the original vLLM source SHA.
+A runtime mismatch
 fails before installing the wheel or running tests, rather than changing the
 agent's dependencies automatically. Build-only does not require a visible GPU,
 but still requires CUDA-enabled Torch and the compiler/toolkit configuration;
@@ -114,7 +117,56 @@ only, not the build job or the entire build. It downloads the saved wheel
 again and uses a fresh test checkout/venv. Artifact retention must cover the
 delay before testing. Deliberately retrying the producer build replaces its
 recorded artifact reference; ordinary test-only retries leave it unchanged.
-This split pipeline does not select artifacts from older Buildkite builds.
+
+#### Test an earlier build without recompiling
+
+After this version of ci-infra is pushed, create a **new build** of the same
+ARM64 pipeline with the environment variable:
+
+```text
+VLLM_WINDOWS_TEST_BUILD_ID=<producer Buildkite build UUID>
+```
+
+This is the original run's **`BUILDKITE_BUILD_ID`**, not the displayed build
+number (`8`), its URL, or a job ID. Get it from the original build job's
+**Environment** tab, or from `producer.build_id` inside its
+`artifacts/windows-arm64/build-manifest.json` artifact.
+
+In Buildkite **New Build**, use the current ci-infra branch/commit so the test
+job receives the latest runner fixes, and put the variable above in the build's
+environment variables. Keep the pipeline's initial upload command unchanged.
+When `windows-arm64.yml` is uploaded, it skips source resolution, wheel
+compilation, and the approval block. **Full pytest suite (arm64)** runs directly
+against the prior wheel. Automatic test-job retries remain disabled.
+
+The test command can also select the source explicitly inside a Buildkite job:
+
+```powershell
+python buildkite\windows\ci.py test --architecture arm64 --source-build-id <producer-build-uuid>
+```
+
+The CLI value takes precedence over the environment variable. No separate API
+token is required by this code: metadata and artifact commands use the current
+agent job credentials, which must have access to the source build.
+The original build must retain its `windows-wheel-arm64` metadata, wheel,
+checksum, and `build-manifest.json` from a successful split-pipeline build job.
+Missing or inaccessible artifacts/metadata fail explicitly; there is no rebuild
+or fallback to a different wheel.
+
+The runner reads metadata from the selected source build and downloads only
+the recorded producer job's files. Manifest/wheel hashes, producer identity,
+source SHA and runtime compatibility checks still apply. Only the requirement
+for identical **ci-infra** commits is relaxed in this explicit mode, allowing
+new diagnostics against an older wheel. `test-run.json` records the current
+test build ID and runner commit; `producer.json` and `build-manifest.json` keep
+the original build identity.
+
+Set the variable **when creating the new Buildkite build**: conditions are
+evaluated during pipeline upload. A build already queued at an older ci-infra
+commit does not acquire this feature merely by changing files locally.
+Leave the variable unset to retain build -> manual approval -> test behavior.
+An existing agent must be available for the upload and test jobs; a waiting
+upload step has not yet created the rest of the pipeline.
 
 **The smoke-test pool is not sufficient for every upstream test.** Full tests
 need compatible packages beyond the pytest harness, including model/audio/video
