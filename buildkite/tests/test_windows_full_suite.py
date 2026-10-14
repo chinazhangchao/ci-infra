@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -11,8 +12,78 @@ import pytest
 from buildkite.windows import ci, run_tests
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Exercises native MSVC env setup")
+@pytest.mark.parametrize("architecture", ["x64", "arm64"])
+@pytest.mark.parametrize("failure", [None, "exit", "target", "headers", "compiler"])
+def test_compiler_setup_propagates_environment_without_compiling(
+    tmp_path, monkeypatch, architecture, failure
+):
+    tools = tmp_path / "tools with spaces & punctuation"
+    tools.mkdir()
+    shutil.copyfile(ci.HERE / "test-environment.cmd", tools / "test-environment.cmd")
+    monkeypatch.setattr(ci, "HERE", tools)
+    compiler = tools / "cl.exe"
+    compiler.touch()
+    vcvars = tools / "vcvarsall.bat"
+    vcvars.write_text(
+        "@echo off\n"
+        f'echo %*>"{tools / "args.txt"}"\n'
+        + ("exit /b 17\n" if failure == "exit" else "")
+        + f'set "VSCMD_ARG_TGT_ARCH={"incorrect" if failure == "target" else architecture}"\n'
+        + f'set "INCLUDE={"" if failure == "headers" else "test-headers"}"\n'
+        + 'set "LIB=test-libraries"\n'
+        + f'set "PATH={tools};%PATH%"\n'
+        + "exit /b 0\n"
+    )
+    original = {
+        **os.environ,
+        "VLLM_WINDOWS_VS_PATH": str(vcvars),
+        "VLLM_WINDOWS_VCVARSALL": str(vcvars),
+        "CC": "wrong-compiler.exe",
+        "CXX": "wrong-compiler.exe",
+        "TEST_UNCHANGED": "value=with=equals",
+    }
+    before = dict(original)
+    if failure == "compiler":
+        monkeypatch.setattr(ci.shutil, "which", lambda *args, **kwargs: None)
+    if failure:
+        with pytest.raises(RuntimeError, match="setup failed|did not initialize"):
+            ci.test_compiler_environment(architecture, original)
+    else:
+        prepared = ci.test_compiler_environment(architecture, original)
+        assert prepared["CC"] == str(compiler)
+        assert prepared["CXX"] == str(compiler)
+        assert prepared["INCLUDE"] == "test-headers"
+        assert prepared["LIB"] == "test-libraries"
+        assert prepared["TEST_UNCHANGED"] == "value=with=equals"
+        assert not any(name.startswith("VLLM_TEST_") for name in prepared)
+        assert (tools / "args.txt").read_text().strip() == (
+            "arm64 10.0.26100.0 -vcvars_ver=14.51.36231"
+            if architecture == "arm64"
+            else "x64"
+        )
+    assert original == before
+
+
+@pytest.mark.parametrize(
+    "variable,value",
+    [
+        ("VLLM_WINDOWS_MSVC_VERSION", "14.51 & unwanted"),
+        ("VLLM_WINDOWS_SDK_VERSION", "10.0.26100.0 & unwanted"),
+    ],
+)
+def test_compiler_rejects_invalid_version_arguments(tmp_path, variable, value):
+    vcvars = tmp_path / "vcvarsall.bat"
+    vcvars.touch()
+    env = {"VLLM_WINDOWS_VS_PATH": str(vcvars), variable: value}
+    with pytest.raises(ValueError, match=variable):
+        ci.test_compiler_environment("arm64", env)
+
+
 @pytest.mark.parametrize("no_index", [False, True])
-@pytest.mark.parametrize("failed_phase", [None, "harness", "wheel", "pytest"])
+@pytest.mark.parametrize(
+    "failed_phase", [None, "compiler", "harness", "wheel", "pytest"]
+)
 def test_full_suite_setup_preserves_pool_and_failure(
     tmp_path, monkeypatch, no_index, failed_phase
 ):
@@ -29,6 +100,23 @@ def test_full_suite_setup_preserves_pool_and_failure(
         "VLLM_WINDOWS_NO_INDEX": "1" if no_index else "0",
     }
     calls = []
+    compiler_env = {
+        **original,
+        "PATH": "compiler-path",
+        "CC": "cl.exe",
+        "CXX": "cl.exe",
+        "INCLUDE": "msvc-include",
+        "LIB": "msvc-lib",
+    }
+
+    def compiler_environment(architecture, env):
+        assert architecture == "arm64"
+        assert env is original
+        if failed_phase == "compiler":
+            raise RuntimeError("Compiler setup failed")
+        return compiler_env
+
+    monkeypatch.setattr(ci, "test_compiler_environment", compiler_environment)
 
     def run(args, **kwargs):
         args = [str(arg) for arg in args]
@@ -58,7 +146,14 @@ def test_full_suite_setup_preserves_pool_and_failure(
         tmp_path,
         output,
         original,
+        "arm64",
     )
+    if failed_phase == "compiler":
+        with pytest.raises(RuntimeError, match="Compiler setup failed"):
+            ci.run_full_tests(*args)
+        assert not calls
+        assert not (tmp_path / "test-venv").exists()
+        return
     if failed_phase:
         with pytest.raises(subprocess.CalledProcessError) as error:
             ci.run_full_tests(*args)
@@ -84,6 +179,9 @@ def test_full_suite_setup_preserves_pool_and_failure(
         assert "PYTHONPATH" not in kwargs["env"]
         assert "PYTEST_ADDOPTS" not in kwargs["env"]
         assert kwargs["env"]["VIRTUAL_ENV"] == str(tmp_path / "test-venv")
+        assert kwargs["env"]["CC"] == "cl.exe"
+        assert kwargs["env"]["INCLUDE"] == "msvc-include"
+        assert kwargs["env"]["PATH"].endswith(os.pathsep + "compiler-path")
     if failed_phase == "harness":
         assert len(calls) == 2
     if failed_phase == "wheel":
@@ -91,9 +189,17 @@ def test_full_suite_setup_preserves_pool_and_failure(
     if not failed_phase or failed_phase == "pytest":
         assert len(calls) == 4
         assert "--no-deps" in calls[2][0]
+        assert "--only-binary=:all:" in calls[2][0]
+        assert "--no-compile" in calls[2][0]
         assert str(wheel) in calls[2][0]
         assert calls[-1][0][1:3] == ["-I", str(ci.HERE / "run_tests.py")]
         assert calls[-1][1]["cwd"] == source
+        assert (inherited.parent / "_vllm_ci_wheel_imports.py").read_text() == (
+            ci.HERE / "wheel_imports.py"
+        ).read_text()
+        assert (inherited.parent / "vllm-ci-wheel.pth").read_text().strip() == (
+            "import _vllm_ci_wheel_imports"
+        )
 
 
 def test_full_runner_rejects_cached_or_source_package(tmp_path, monkeypatch):
@@ -144,6 +250,8 @@ def prepare_full_runner(tmp_path):
         if path and ("site-packages" in path or "dist-packages" in path)
     ]
     (site / "test-harness.pth").write_text("\n".join(inherited) + "\n")
+    shutil.copyfile(ci.HERE / "wheel_imports.py", site / "_vllm_ci_wheel_imports.py")
+    (site / "vllm-ci-wheel.pth").write_text("import _vllm_ci_wheel_imports\n")
     installed = site / "vllm"
     installed.mkdir()
     (installed / "__init__.py").write_text("ORIGIN = 'built-wheel'\n")
@@ -192,10 +300,12 @@ def test_full_runner_really_runs_optional_tests_without_filters(
         "    assert VALUE == 17\n"
         "@pytest.mark.optional\n"
         "def test_optional():\n"
-        "    assert True\n"
+        "    with pytest.raises(RuntimeError, match='CUDA error: out of memory'):\n"
+        "        raise RuntimeError('CUDA error: out of memory')\n"
         "def test_child_imports_installed_package():\n"
         "    subprocess.run([sys.executable, '-c', "
-        "\"import vllm; assert vllm.ORIGIN == 'built-wheel'\"], check=True)\n"
+        '"import os, sys; sys.path.insert(0, os.getcwd()); '
+        "import vllm; assert vllm.ORIGIN == 'built-wheel'\"], check=True)\n"
     )
     if collection_failure:
         (tests / "test_missing_dependency.py").write_text(
@@ -266,6 +376,92 @@ def test_full_runner_really_runs_optional_tests_without_filters(
             assert events[0]["phase"] == "collection"
             assert "missing_windows_backend_for_test" in events[0]["traceback"]
             assert "COLLECTION FAILED:" in result.stdout
+
+
+def test_child_import_hook_rejects_missing_wheel_instead_of_source(tmp_path):
+    python, source, tests, output, env = prepare_full_runner(tmp_path)
+    site = next((python.parent.parent).rglob("_vllm_ci_wheel_imports.py")).parent
+    (site / "vllm").rename(site / "removed-vllm")
+    result = subprocess.run(
+        [str(python), "-c", "import vllm"],
+        cwd=source,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "refusing source fallback" in result.stderr
+    assert "Imported source instead of wheel" not in result.stderr
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "CUDA error: out of memory",
+        "CUDA error: an illegal memory access was encountered",
+        "CUDA error: device-side assert triggered",
+        "CUDA_ERROR_OUT_OF_MEMORY",
+        "Sticky error detected",
+    ],
+)
+@pytest.mark.parametrize("phase", ["call", "setup", "teardown"])
+def test_cuda_failure_stops_after_teardown_and_records_incomplete_suite(
+    tmp_path, message, phase
+):
+    python, source, tests, output, env = prepare_full_runner(tmp_path)
+    (tests / "test_cuda_failure.py").write_text(
+        "import pathlib, pytest\n"
+        f"output = pathlib.Path({str(output)!r})\n"
+        "@pytest.fixture(autouse=True)\n"
+        "def cleanup(request):\n"
+        "    request.addfinalizer(lambda: (output / 'teardown.txt').write_text('done'))\n"
+        + (f"    raise RuntimeError({message!r})\n" if phase == "setup" else "")
+        + "    yield\n"
+        + (f"    raise RuntimeError({message!r})\n" if phase == "teardown" else "")
+        + "def test_a_cuda_failure():\n"
+        + (
+            f"    raise RuntimeError({message!r})\n"
+            if phase == "call"
+            else "    pass\n"
+        )
+        + "def test_b_must_not_run():\n"
+        "    (output / 'unexpected.txt').write_text('cascaded')\n"
+    )
+    result = subprocess.run(
+        [
+            str(python),
+            "-I",
+            str(Path(run_tests.__file__)),
+            "--source-dir",
+            str(source),
+            "--output",
+            str(output),
+        ],
+        cwd=source,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    summary = json.loads((output / "pytest-summary.json").read_text())
+    assert summary["status"] == "aborted"
+    assert summary["collected"] == 2
+    assert summary["completed"] == 1
+    assert summary["failed"] == 1
+    assert summary["exit_code"] == 1
+    assert "test_a_cuda_failure" in summary["stop_reason"]
+    assert summary["active_test"] is None
+    assert (output / "teardown.txt").read_text() == "done"
+    assert not (output / "unexpected.txt").exists()
+    events = [
+        json.loads(line)
+        for line in (output / "pytest-failures.jsonl").read_text().splitlines()
+    ]
+    assert events[0]["phase"] == phase
+    assert message in events[0]["traceback"]
+    assert (output / "pytest.xml").is_file()
 
 
 @pytest.mark.parametrize("termination", ["hard-exit", "interrupt"])

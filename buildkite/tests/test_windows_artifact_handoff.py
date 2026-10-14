@@ -242,7 +242,8 @@ def test_test_job_downloads_exact_producer_and_never_compiles(
         assert "nvcc.exe" not in " ".join(args)
         assert "build-win-arm64.ps1" not in " ".join(args)
 
-    def full_tests(python, venv, source, downloaded, work, output, test_env):
+    def full_tests(python, venv, source, downloaded, work, output, test_env, target):
+        assert target == "arm64"
         full_calls.append(source)
         assert downloaded != wheel
         assert ci.sha256_file(downloaded) == ci.sha256_file(wheel)

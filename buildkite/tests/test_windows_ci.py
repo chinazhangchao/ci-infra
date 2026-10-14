@@ -505,7 +505,8 @@ def test_build_lifecycle(tmp_path, monkeypatch, architecture, test_suite, failur
     monkeypatch.setattr(ci, "build_command", lambda *args: ["compile-wheel"])
     full_calls = []
 
-    def full_tests(python, venv, source, wheel, work, output, env):
+    def full_tests(python, venv, source, wheel, work, output, env, target):
+        assert target == architecture
         assert any(args == ["compile-wheel"] for args, _ in calls)
         assert wheel.is_file()
         full_calls.append(source)

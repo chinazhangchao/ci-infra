@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -496,13 +497,89 @@ def test_build(architecture, source_build_id=None):
         )
         source = work / "src"
         checkout_source(source, manifest["source"], env)
-        run_full_tests(python, venv, source, wheel, work, output, env)
+        run_full_tests(python, venv, source, wheel, work, output, env, architecture)
 
 
-def run_full_tests(python, venv, source, wheel, work, output, env):
+def test_compiler_environment(architecture, env):
+    prepared = {key.upper(): value for key, value in env.items()}
+    variable = (
+        "VLLM_WINDOWS_VS_PATH" if architecture == "arm64" else "VLLM_WINDOWS_VCVARSALL"
+    )
+    vcvars = Path(required(prepared, variable)).resolve()
+    if vcvars.is_dir():
+        vcvars = vcvars / "VC" / "Auxiliary" / "Build" / "vcvarsall.bat"
+    if not vcvars.is_file():
+        raise FileNotFoundError(
+            f"Test compiler environment script is missing: {vcvars}"
+        )
+    arguments = architecture
+    if architecture == "arm64":
+        version = prepared.get("VLLM_WINDOWS_MSVC_VERSION", "14.51.36231")
+        sdk = prepared.get("VLLM_WINDOWS_SDK_VERSION", "10.0.26100.0")
+        if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+            raise ValueError("Invalid VLLM_WINDOWS_MSVC_VERSION for test compiler.")
+        if not re.fullmatch(r"\d+\.\d+\.\d+\.\d+", sdk):
+            raise ValueError("Invalid VLLM_WINDOWS_SDK_VERSION for test compiler.")
+        arguments += f" {sdk} -vcvars_ver={version}"
+    bootstrap = {
+        **prepared,
+        "VLLM_TEST_VCVARS": str(vcvars),
+        "VLLM_TEST_VCVARS_ARGS": arguments,
+    }
+    if prepared.get("PROGRAMFILES(X86)"):
+        installer = (
+            Path(prepared["PROGRAMFILES(X86)"])
+            / "Microsoft Visual Studio"
+            / "Installer"
+        )
+        if (installer / "vswhere.exe").is_file():
+            bootstrap["PATH"] = str(installer) + os.pathsep + prepared.get("PATH", "")
+    result = subprocess.run(
+        [
+            required(prepared, "COMSPEC"),
+            "/d",
+            "/c",
+            "call",
+            str(HERE / "test-environment.cmd"),
+        ],
+        env=bootstrap,
+        stdout=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if result.returncode:
+        raise RuntimeError(
+            f"Test compiler setup failed (exit {result.returncode}):\n{result.stdout}"
+        )
+    lines = result.stdout.splitlines()
+    marker = "__VLLM_TEST_ENVIRONMENT__"
+    if marker not in lines:
+        raise RuntimeError("Test compiler setup did not return its environment.")
+    for line in lines[lines.index(marker) + 1 :]:
+        name, separator, value = line.partition("=")
+        if name and separator and not name.startswith("VLLM_TEST_"):
+            prepared[name.upper()] = value
+    compiler = shutil.which("cl.exe", path=prepared.get("PATH", ""))
+    if (
+        prepared.get("VSCMD_ARG_TGT_ARCH", "").lower() != architecture
+        or not prepared.get("INCLUDE")
+        or not prepared.get("LIB")
+        or not compiler
+    ):
+        raise RuntimeError(
+            f"Visual Studio did not initialize the {architecture} compiler, headers and libraries."
+        )
+    prepared["CC"] = compiler
+    prepared["CXX"] = compiler
+    print(f"Full-suite JIT compiler: {compiler}", flush=True)
+    return prepared
+
+
+def run_full_tests(python, venv, source, wheel, work, output, env, architecture):
     summary_path = output / "pytest-summary.json"
     summary = {"suite": "full", "status": "preparing-test-environment"}
     summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    compiler_env = test_compiler_environment(architecture, env)
     test_venv = Path(work) / "test-venv"
     run([python, "-I", "-m", "venv", test_venv], cwd=work, env=env)
     test_python = test_venv / "Scripts" / "python.exe"
@@ -512,9 +589,9 @@ def run_full_tests(python, venv, source, wheel, work, output, env):
     (test_site / "pool-dependencies.pth").write_text(
         str(venv / "Lib" / "site-packages") + "\n", encoding="utf-8"
     )
-    test_env = dict(env)
+    test_env = dict(compiler_env)
     test_env["VIRTUAL_ENV"] = str(test_venv)
-    test_env["PATH"] = str(test_python.parent) + os.pathsep + env["PATH"]
+    test_env["PATH"] = str(test_python.parent) + os.pathsep + compiler_env["PATH"]
     test_env.pop("PYTHONPATH", None)
     test_env.pop("PYTEST_ADDOPTS", None)
     install = [
@@ -539,12 +616,18 @@ def run_full_tests(python, venv, source, wheel, work, output, env):
             "pip",
             "--isolated",
             "install",
+            "--only-binary=:all:",
             "--no-deps",
+            "--no-compile",
             "--ignore-installed",
             wheel,
         ],
         cwd=work,
         env=test_env,
+    )
+    shutil.copyfile(HERE / "wheel_imports.py", test_site / "_vllm_ci_wheel_imports.py")
+    (test_site / "vllm-ci-wheel.pth").write_text(
+        "import _vllm_ci_wheel_imports\n", encoding="utf-8"
     )
     run(
         [
@@ -602,7 +685,7 @@ def build(architecture, test_suite="smoke"):
             )
             return
         if test_suite == "full":
-            run_full_tests(python, venv, source, wheel, work, output, env)
+            run_full_tests(python, venv, source, wheel, work, output, env, architecture)
             return
         installed = Path(work) / "installed"
         # Do not replace vLLM or its dependencies in the pool's provisioned environment.

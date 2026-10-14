@@ -65,7 +65,19 @@ file, installs the [pytest harness](requirements-tests.txt), and installs the
 new wheel locally with its console scripts. No packages in the pool venv are
 replaced. The runner checks that vLLM imports from this job's installed wheel,
 not the source checkout or a cached vLLM. Child Python processes receive the
-same package/test paths.
+same package/test paths. A startup import hook, installed only in the disposable
+test venv, resolves `vllm` from that venv even when an upstream subprocess helper
+prepends the source checkout to `sys.path`. A missing wheel is an error, not a
+fallback to source imports.
+
+Before starting the test venv, the job initializes the configured Visual Studio
+environment for its native architecture and sets `CC`/`CXX` to that MSVC compiler.
+On ARM64 it uses `VLLM_WINDOWS_VS_PATH`, `VLLM_WINDOWS_MSVC_VERSION` (default
+`14.51.36231`) and `VLLM_WINDOWS_SDK_VERSION` (default `10.0.26100.0`).
+This supports Triton/Inductor's **runtime JIT**, which still compiles launchers
+and kernels as part of the tests. Dependency installation remains wheel-only;
+the test job does not rebuild vLLM or compile Python dependency packages.
+Compiler, header or library discovery failures stop setup before pytest starts.
 
 The effective pytest invocation is:
 
@@ -79,6 +91,12 @@ Inherited `PYTEST_ADDOPTS` and configured `addopts` are cleared. Collection
 errors remain failures, but do not prevent otherwise collectable tests from
 running. The fork's own skip/xfail conditions still apply. Pytest failures,
 collection errors, and initialization errors fail the Buildkite job.
+The exception to continuing after failures is a failed test reporting CUDA
+out-of-memory, illegal-memory-access, device-side-assert or sticky-context
+errors: after that test's teardown, the runner aborts with exit code 1 instead
+of running further tests against an exhausted or poisoned CUDA context.
+The full tree remains selected; unexecuted tests are not reported as passed
+or skipped. Expected errors caught by tests do not trigger this guard.
 This invokes the Python pytest tree, not upstream CI's separate shell scripts,
 Rust cargo tests, or a matrix of CUDA/ROCm/TPU machines.
 
@@ -90,7 +108,9 @@ and test runtime:
 - `pytest-summary.json` is checkpointed during collection and test execution.
   It records collected/completed tests, passes, failed reports (including
   setup/teardown), skips, collection errors, the active test and the final
-  pytest exit code.
+  pytest exit code. CUDA resource/context failures also record `stop_reason`
+  and finish with `status: aborted`, distinguishing an incomplete suite from
+  an ordinary completed run with failures.
 - `pytest-failures.jsonl` is appended and closed after each failure, preserving
   the node ID, phase, traceback and captured stdout/stderr/log sections.
   It is created only when failures occur. Collection and test failures also
@@ -106,6 +126,11 @@ requires the Buildkite agent to survive the job; losing the machine may also
 lose local files. If environment setup fails before the runner starts, the
 preparation status remains in `pytest-summary.json` and the error is in the
 Buildkite log.
+Before retrying an aborted CUDA run, check that GPU memory has been released
+and that the test's model/tensor sizes fit the available device memory.
+Rerunning the entire suite unchanged will not fix missing dependencies,
+Linux-only APIs (such as `fork`, `getpgid` and `fcntl`), unavailable model access,
+or insufficient GPU memory; those remain explicit failures, not automatic skips.
 Build and test have independent timeouts of 6 hours and 24 hours respectively;
 the combined pipeline's timeouts are unchanged.
 

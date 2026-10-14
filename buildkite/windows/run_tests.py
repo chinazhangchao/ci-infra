@@ -9,6 +9,16 @@ import traceback
 from pathlib import Path
 
 
+FATAL_CUDA_ERRORS = (
+    "torch.OutOfMemoryError",
+    "CUDA error: out of memory",
+    "CUDA_ERROR_OUT_OF_MEMORY",
+    "CUDA error: an illegal memory access",
+    "device-side assert triggered",
+    "Sticky error detected",
+)
+
+
 class TestResults:
     def __init__(self, output, source):
         self.output = output
@@ -26,6 +36,7 @@ class TestResults:
             "failed": 0,
             "skipped": 0,
             "collection_errors": 0,
+            "stop_reason": None,
         }
         self.update()
 
@@ -86,6 +97,13 @@ class TestResults:
                 report.nodeid, report.when, report.longreprtext, report.sections
             )
             self.update(failed=self.summary["failed"] + 1)
+            if any(error in report.longreprtext for error in FATAL_CUDA_ERRORS):
+                self.update(
+                    stop_reason=(
+                        f"CUDA resource/context failure in {report.nodeid} "
+                        f"({report.when}); remaining tests were not run."
+                    )
+                )
         elif report.skipped:
             self.update(skipped=self.summary["skipped"] + 1)
         elif report.when == "call" and report.passed:
@@ -93,6 +111,10 @@ class TestResults:
 
     def pytest_runtest_logfinish(self, nodeid, location):
         self.update(active_test=None, completed=self.summary["completed"] + 1)
+        if self.summary["stop_reason"]:
+            # Abort after teardown so a bad CUDA context cannot contaminate later tests.
+            pytest = importlib.import_module("pytest")
+            pytest.exit(self.summary["stop_reason"], returncode=1)
 
     def pytest_internalerror(self, excrepr, excinfo):
         self.failure(None, "internal", str(excrepr))
@@ -160,7 +182,9 @@ def run_tests(source, output):
             results.update(status="error")
         else:
             status = (
-                "passed"
+                "aborted"
+                if results.summary["stop_reason"]
+                else "passed"
                 if exit_code == 0
                 else "interrupted"
                 if exit_code == 2
