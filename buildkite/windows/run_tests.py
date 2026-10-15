@@ -37,6 +37,7 @@ class TestResults:
             "skipped": 0,
             "collection_errors": 0,
             "stop_reason": None,
+            "windows_test_helpers": [],
         }
         self.update()
 
@@ -76,7 +77,12 @@ class TestResults:
         self.update(status="collecting")
 
     def pytest_collection_finish(self, session):
-        self.update(collected=len(session.items), status="running")
+        compatibility = sys.modules.get("_vllm_ci_windows_helpers")
+        self.update(
+            collected=len(session.items),
+            status="running",
+            windows_test_helpers=list(getattr(compatibility, "APPLIED_HELPERS", [])),
+        )
 
     def pytest_deselected(self, items):
         self.update(deselected=self.summary["deselected"] + len(items))
@@ -146,6 +152,7 @@ def execute_tests(source, output, results):
     site_packages = package.parent.parent
     os.environ["PYTHONPATH"] = os.pathsep.join([str(site_packages), str(source)])
     os.environ["PYTHONSAFEPATH"] = "1"
+    os.environ["_VLLM_CI_TEST_SOURCE"] = str(source)
     os.environ.pop("PYTEST_ADDOPTS", None)
     # The checkout's tests package must also beat unrelated site-packages/tests.
     sys.path[:0] = [str(site_packages), str(source)]

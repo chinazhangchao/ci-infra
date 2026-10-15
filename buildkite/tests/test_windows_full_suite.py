@@ -198,8 +198,11 @@ def test_full_suite_setup_preserves_pool_and_failure(
             ci.HERE / "wheel_imports.py"
         ).read_text()
         assert (inherited.parent / "vllm-ci-wheel.pth").read_text().strip() == (
-            "import _vllm_ci_wheel_imports"
+            "import _vllm_ci_wheel_imports; import _vllm_ci_windows_helpers"
         )
+        assert (inherited.parent / "_vllm_ci_windows_helpers.py").read_text() == (
+            ci.HERE / "windows_helpers.py"
+        ).read_text()
 
 
 def test_full_runner_rejects_cached_or_source_package(tmp_path, monkeypatch):
@@ -251,7 +254,12 @@ def prepare_full_runner(tmp_path):
     ]
     (site / "test-harness.pth").write_text("\n".join(inherited) + "\n")
     shutil.copyfile(ci.HERE / "wheel_imports.py", site / "_vllm_ci_wheel_imports.py")
-    (site / "vllm-ci-wheel.pth").write_text("import _vllm_ci_wheel_imports\n")
+    shutil.copyfile(
+        ci.HERE / "windows_helpers.py", site / "_vllm_ci_windows_helpers.py"
+    )
+    (site / "vllm-ci-wheel.pth").write_text(
+        "import _vllm_ci_wheel_imports; import _vllm_ci_windows_helpers\n"
+    )
     installed = site / "vllm"
     installed.mkdir()
     (installed / "__init__.py").write_text("ORIGIN = 'built-wheel'\n")

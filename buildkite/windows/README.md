@@ -70,6 +70,33 @@ test venv, resolves `vllm` from that venv even when an upstream subprocess helpe
 prepends the source checkout to `sys.path`. A missing wheel is an error, not a
 fallback to source imports.
 
+On Windows, the same disposable-venv startup hook adapts the pinned checkout's
+`tests.utils` process helpers before tests import them:
+
+- `fork_new_process_for_each_test`, `spawn_new_process_for_each_test` and the
+  `create_new_process_for_each_test` factory use a fresh Python interpreter.
+  Functions are resolved by module and qualified name, preserving module
+  singletons in the child. Children inherit the parent's import paths before
+  deserializing arguments, including pytest's paths for non-package test modules.
+  Arguments must be serializable by `cloudpickle`;
+  local/non-importable test functions fail explicitly. This is spawn-based
+  isolation, not emulation of fork's inherited memory.
+- The OpenAI, launch-render and custom server helpers launch inside an owned
+  Windows Job Object. A child waits for job assignment before executing test
+  or server code. Shutdown terminates that job and waits for its descendants,
+  even if the root has already exited; unrelated processes are not targeted.
+  Closing the owning process's job handle also terminates remaining children.
+- Child assertion/exception failures, nonzero exits and exits without a result
+  fail the test. Child skips and xfails remain skips and xfails, not passes.
+  Result files are closed before reading/removal to avoid Windows sharing errors.
+
+These adapters apply only to the selected checkout's test-helper module on
+Windows. They do not change global `os`/`signal` APIs, modify the wheel, or add
+test exclusions. Applied adapters are recorded in `pytest-summary.json` under
+`windows_test_helpers`. Other POSIX-only code still requires a real port.
+In particular, the hidden-states connector's `fcntl.flock` usage is production
+wheel code, not a test helper, and is not replaced by this adapter.
+
 Before starting the test venv, the job initializes the configured Visual Studio
 environment for its native architecture and sets `CC`/`CXX` to that MSVC compiler.
 On ARM64 it uses `VLLM_WINDOWS_VS_PATH`, `VLLM_WINDOWS_MSVC_VERSION` (default
@@ -129,7 +156,7 @@ Buildkite log.
 Before retrying an aborted CUDA run, check that GPU memory has been released
 and that the test's model/tensor sizes fit the available device memory.
 Rerunning the entire suite unchanged will not fix missing dependencies,
-Linux-only APIs (such as `fork`, `getpgid` and `fcntl`), unavailable model access,
+POSIX-only code outside the adapted helpers, unavailable model access,
 or insufficient GPU memory; those remain explicit failures, not automatic skips.
 Build and test have independent timeouts of 6 hours and 24 hours respectively;
 the combined pipeline's timeouts are unchanged.
@@ -681,10 +708,11 @@ test; only consume artifacts from a successful job.
 Run infrastructure tests (no CUDA needed):
 
 ```powershell
-python -m pytest buildkite\tests\test_windows_ci.py buildkite\tests\test_windows_full_suite.py buildkite\tests\test_windows_artifact_handoff.py
+python -m pytest buildkite\tests\test_windows_ci.py buildkite\tests\test_windows_full_suite.py buildkite\tests\test_windows_artifact_handoff.py buildkite\tests\test_windows_helpers.py
 ```
 
-Native `.cmd` exit-code tests run on Windows and are skipped on other hosts.
+Native `.cmd`, Job Object cleanup and Windows helper tests run on Windows and
+are skipped on other hosts.
 Provisioning tests require PowerShell 7; they mock tool installation and agent
 startup and never register an agent or install CUDA/toolchains.
 Actual wheel compilation and CUDA kernel execution require the provisioned

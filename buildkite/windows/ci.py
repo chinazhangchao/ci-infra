@@ -626,8 +626,12 @@ def run_full_tests(python, venv, source, wheel, work, output, env, architecture)
         env=test_env,
     )
     shutil.copyfile(HERE / "wheel_imports.py", test_site / "_vllm_ci_wheel_imports.py")
+    shutil.copyfile(
+        HERE / "windows_helpers.py", test_site / "_vllm_ci_windows_helpers.py"
+    )
     (test_site / "vllm-ci-wheel.pth").write_text(
-        "import _vllm_ci_wheel_imports\n", encoding="utf-8"
+        "import _vllm_ci_wheel_imports; import _vllm_ci_windows_helpers\n",
+        encoding="utf-8",
     )
     run(
         [
