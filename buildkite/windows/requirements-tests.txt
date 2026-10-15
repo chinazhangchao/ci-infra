@@ -1,5 +1,6 @@
-# Harness for the fork's complete tests tree. Model/backend dependencies belong
-# in the pool runtime environment; missing dependencies remain test failures.
+# Harness and public data/audio wheels for the fork's complete tests tree.
+# Other model/backend dependencies belong in the pool runtime environment;
+# missing dependencies remain test failures.
 pytest>=8,<10
 pytest-asyncio
 pytest-rerunfailures
@@ -8,3 +9,5 @@ pytest-timeout
 pytest-cov
 tblib
 cloudpickle
+pandas==3.0.6
+soundfile==0.14.0

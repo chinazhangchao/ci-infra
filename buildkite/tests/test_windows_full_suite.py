@@ -1,3 +1,4 @@
+import ctypes
 import json
 import os
 import shutil
@@ -10,6 +11,141 @@ from unittest.mock import Mock
 import pytest
 
 from buildkite.windows import ci, run_tests
+
+
+def test_public_data_dependencies_are_installed_from_index():
+    from packaging.requirements import Requirement
+
+    requirements = {}
+    for raw in (ci.HERE / "requirements-tests.txt").read_text().splitlines():
+        if line := raw.split("#", 1)[0].strip():
+            requirement = Requirement(line)
+            requirements[requirement.name] = requirement
+    for name, version in (("pandas", "3.0.6"), ("soundfile", "0.14.0")):
+        assert str(requirements[name].specifier) == f"=={version}"
+        assert requirements[name].url is None
+
+
+@pytest.mark.parametrize("winerror", [5, 32, 33])
+@pytest.mark.parametrize("failures", [1, len(run_tests.CHECKPOINT_RETRY_DELAYS)])
+def test_checkpoint_retries_windows_contention_atomically(
+    tmp_path, monkeypatch, capsys, winerror, failures
+):
+    results = run_tests.TestResults(tmp_path, tmp_path / "source")
+    destination = tmp_path / "pytest-summary.json"
+    previous = destination.read_bytes()
+    original_replace = Path.replace
+    replacements = []
+    sleeps = Mock()
+    error = PermissionError("Temporarily locked checkpoint")
+    error.winerror = winerror
+
+    def replace(source, target):
+        replacements.append((source, target))
+        assert destination.read_bytes() == previous
+        assert json.loads(source.read_text())["completed"] == 1
+        if len(replacements) <= failures:
+            raise error
+        return original_replace(source, target)
+
+    monkeypatch.setattr(Path, "replace", replace)
+    monkeypatch.setattr(run_tests.time, "sleep", sleeps)
+    results.update(completed=1)
+    assert len(replacements) == failures + 1
+    assert [call.args[0] for call in sleeps.call_args_list] == list(
+        run_tests.CHECKPOINT_RETRY_DELAYS[:failures]
+    )
+    assert json.loads(destination.read_text())["completed"] == 1
+    assert not (tmp_path / "pytest-summary.json.tmp").exists()
+    assert capsys.readouterr().err.count("retrying without removing") == 1
+
+
+@pytest.mark.parametrize("winerror", [5, 32, 33])
+def test_checkpoint_permanent_lock_is_bounded_and_preserves_both_versions(
+    tmp_path, monkeypatch, winerror
+):
+    results = run_tests.TestResults(tmp_path, tmp_path / "source")
+    destination = tmp_path / "pytest-summary.json"
+    previous = destination.read_bytes()
+    error = PermissionError("Persistent checkpoint lock")
+    error.winerror = winerror
+    replace = Mock(side_effect=error)
+    sleep = Mock()
+    monkeypatch.setattr(Path, "replace", replace)
+    monkeypatch.setattr(run_tests.time, "sleep", sleep)
+
+    with pytest.raises(PermissionError) as raised:
+        results.update(completed=7)
+    assert raised.value is error
+    assert replace.call_count == len(run_tests.CHECKPOINT_RETRY_DELAYS) + 1
+    assert sleep.call_count == len(run_tests.CHECKPOINT_RETRY_DELAYS)
+    assert destination.read_bytes() == previous
+    pending = tmp_path / "pytest-summary.json.tmp"
+    assert json.loads(pending.read_text())["completed"] == 7
+    assert "retries exhausted" in error.__notes__[-1]
+    assert str(pending) in error.__notes__[-1]
+
+
+@pytest.mark.parametrize("winerror", [None, 2, 6, 112])
+def test_checkpoint_does_not_retry_other_io_errors(tmp_path, monkeypatch, winerror):
+    results = run_tests.TestResults(tmp_path, tmp_path / "source")
+    error = OSError("Unrelated I/O failure")
+    if winerror is not None:
+        error.winerror = winerror
+    replace = Mock(side_effect=error)
+    sleep = Mock()
+    monkeypatch.setattr(Path, "replace", replace)
+    monkeypatch.setattr(run_tests.time, "sleep", sleep)
+    with pytest.raises(OSError) as raised:
+        results.update(completed=1)
+    assert raised.value is error
+    replace.assert_called_once()
+    sleep.assert_not_called()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Uses a native Windows file lock")
+def test_checkpoint_recovers_when_windows_reader_releases_handle(tmp_path, monkeypatch):
+    results = run_tests.TestResults(tmp_path, tmp_path / "source")
+    destination = tmp_path / "pytest-summary.json"
+    previous = destination.read_bytes()
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    kernel.CreateFileW.restype = ctypes.c_void_p
+    kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel.CloseHandle.restype = ctypes.c_int
+    # Share reads/writes but not deletion, as an ordinary Windows reader can do.
+    handle = kernel.CreateFileW(str(destination), 0x80000000, 3, None, 3, 0, None)
+    assert handle != ctypes.c_void_p(-1).value, ctypes.WinError(ctypes.get_last_error())
+    delays = []
+
+    def release_reader(delay):
+        nonlocal handle
+        delays.append(delay)
+        assert destination.read_bytes() == previous
+        assert (
+            json.loads((tmp_path / "pytest-summary.json.tmp").read_text())["completed"]
+            == 1
+        )
+        assert kernel.CloseHandle(handle)
+        handle = None
+
+    monkeypatch.setattr(run_tests.time, "sleep", release_reader)
+    try:
+        results.update(completed=1)
+    finally:
+        if handle is not None:
+            kernel.CloseHandle(handle)
+    assert delays == [run_tests.CHECKPOINT_RETRY_DELAYS[0]]
+    assert json.loads(destination.read_text())["completed"] == 1
+    assert not (tmp_path / "pytest-summary.json.tmp").exists()
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Exercises native MSVC env setup")
@@ -292,6 +428,63 @@ def prepare_full_runner(tmp_path):
     env["PYTEST_ADDOPTS"] = "-x -k nonexistent"
     env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
     return python, source, tests, output, env
+
+
+@pytest.mark.parametrize("test_failure", [False, True])
+def test_checkpoint_contention_does_not_interrupt_pytest_or_hide_failures(
+    tmp_path, test_failure
+):
+    python, source, tests, output, env = prepare_full_runner(tmp_path)
+    (tests / "test_checkpoint.py").write_text(
+        "import json\n"
+        "from pathlib import Path\n"
+        f"checkpoint = Path({str(output / 'pytest-summary.json')!r})\n"
+        "def test_a_contended_checkpoint():\n"
+        "    previous = checkpoint.read_bytes()\n"
+        "    original_replace = Path.replace\n"
+        "    def transient_lock(source, target):\n"
+        "        if target != checkpoint:\n"
+        "            return original_replace(source, target)\n"
+        "        assert checkpoint.read_bytes() == previous\n"
+        "        Path.replace = original_replace\n"
+        "        error = PermissionError('Temporary reader lock')\n"
+        "        error.winerror = 5\n"
+        "        raise error\n"
+        "    Path.replace = transient_lock\n"
+        f"    assert {not test_failure!r}, 'original test failure'\n"
+        "def test_b_runs_after_contention():\n"
+        "    summary = json.loads(checkpoint.read_text())\n"
+        "    assert summary['completed'] == 1\n"
+        f"    assert summary['failed'] == {int(test_failure)}\n"
+    )
+    result = subprocess.run(
+        [
+            str(python),
+            "-I",
+            str(Path(run_tests.__file__)),
+            "--source-dir",
+            str(source),
+            "--output",
+            str(output),
+        ],
+        cwd=source,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == int(test_failure), result.stdout + result.stderr
+    summary = json.loads((output / "pytest-summary.json").read_text())
+    assert summary["completed"] == summary["collected"] == 2
+    assert summary["passed"] == 2 - int(test_failure)
+    assert summary["failed"] == int(test_failure)
+    assert summary["status"] == ("failed" if test_failure else "passed")
+    assert summary["exit_code"] == int(test_failure)
+    assert "retrying without removing" in result.stdout + result.stderr
+    assert "INTERNALERROR>" not in result.stdout + result.stderr
+    if test_failure:
+        event = json.loads((output / "pytest-failures.jsonl").read_text())
+        assert "original test failure" in event["traceback"]
 
 
 @pytest.mark.parametrize("collection_failure", [False, True])
@@ -590,7 +783,7 @@ def test_live_diagnostics_preserve_pytest_internal_error(tmp_path):
     assert result.returncode == 3, result.stdout + result.stderr
     summary = json.loads((output / "pytest-summary.json").read_text())
     assert summary["exit_code"] == 3
-    assert summary["status"] == "failed"
+    assert summary["status"] == "error"
     event = json.loads((output / "pytest-failures.jsonl").read_text())
     assert event["phase"] == "internal"
     assert "broken collection hook" in event["traceback"]

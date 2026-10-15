@@ -61,9 +61,9 @@ the test job requires a working NVIDIA GPU.
 
 The test job creates a disposable test venv, makes the provisioned pool
 dependencies available through a `.pth`
-file, installs the [pytest harness](requirements-tests.txt), and installs the
-new wheel locally with its console scripts. No packages in the pool venv are
-replaced. The runner checks that vLLM imports from this job's installed wheel,
+file, installs the [pytest harness and test dependencies](requirements-tests.txt),
+and installs the new wheel locally with its console scripts. No packages in the
+pool venv are replaced. The runner checks that vLLM imports from this job's installed wheel,
 not the source checkout or a cached vLLM. Child Python processes receive the
 same package/test paths. A startup import hook, installed only in the disposable
 test venv, resolves `vllm` from that venv even when an upstream subprocess helper
@@ -138,6 +138,12 @@ and test runtime:
   pytest exit code. CUDA resource/context failures also record `stop_reason`
   and finish with `status: aborted`, distinguishing an incomplete suite from
   an ordinary completed run with failures.
+  Checkpoint replacement retries transient Windows access/sharing/lock errors
+  for up to 4.55 seconds, with a warning in the log. The last complete JSON
+  remains readable until atomic replacement succeeds. Persistent errors still
+  fail reporting and retain the pending `.tmp` checkpoint for diagnosis; the
+  runner never deletes or truncates the last good checkpoint to bypass a lock.
+  Pytest internal errors finish with `status: error` and `exit_code: 3`.
 - `pytest-failures.jsonl` is appended and closed after each failure, preserving
   the node ID, phase, traceback and captured stdout/stderr/log sections.
   It is created only when failures occur. Collection and test failures also
@@ -233,12 +239,26 @@ the full tree and reports those incompatibilities; it does not claim that
 every test can execute successfully on one ARM64 machine. A root `conftest.py`
 import failure can prevent collection entirely and is a failure, not a skip.
 
+Pandas 3.0.6 and SoundFile 0.14.0 have public Windows ARM64 wheels and are
+included in `requirements-tests.txt`. Pip installs them into the disposable
+test venv from the configured PyPI index (or mirror), with wheel-only mode
+still enforced. They are not copied into this repository's wheelhouse.
+
+The repository's [`wheelhouse`](wheelhouse/) contains local copies of
+`torchvision-0.29.0a0+10f68db-cp313-cp313-win_arm64.whl` and
+`flashinfer_python-0.6.17-py3-none-any.whl`, matching missing imports in build 16.
+This is not a complete test wheelhouse. These files are not automatically
+installed by the pytest harness; provide the relevant runtime requirements and
+wheelhouse path when provisioning. Compatible wheel tags do not guarantee
+TorchVision's ABI compatibility with the selected NVIDIA Torch or FlashInfer's
+Windows/backend support and dependency availability.
+
 Newly provisioned agents carry `VLLM_WINDOWS_WHEELHOUSE` and
 `VLLM_WINDOWS_NO_INDEX` from the provisioning arguments. Full-test harness
 installation uses that wheelhouse and respects `NoIndex`. For an existing pool,
 set these variables in the trusted agent environment before restarting its
 launcher if they are not in `environment.json` yet. With `NoIndex=1`, include
-the harness wheels and their dependencies in the wheelhouse.
+the harness/data/audio wheels and their dependencies in the wheelhouse.
 
 ## Provision the private pools
 

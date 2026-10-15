@@ -5,6 +5,7 @@ import importlib
 import json
 import os
 import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -17,6 +18,7 @@ FATAL_CUDA_ERRORS = (
     "device-side assert triggered",
     "Sticky error detected",
 )
+CHECKPOINT_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.4, 0.8, 1.0, 1.0, 1.0)
 
 
 class TestResults:
@@ -48,7 +50,29 @@ class TestResults:
         temporary.write_text(
             json.dumps(self.summary, indent=2) + "\n", encoding="utf-8"
         )
-        temporary.replace(self.output / "pytest-summary.json")
+        destination = self.output / "pytest-summary.json"
+        # Windows readers/scanners can temporarily prevent an atomic rename.
+        for attempt in range(len(CHECKPOINT_RETRY_DELAYS) + 1):
+            try:
+                temporary.replace(destination)
+                return
+            except OSError as error:
+                if getattr(error, "winerror", None) not in (5, 32, 33):
+                    raise
+                if attempt == len(CHECKPOINT_RETRY_DELAYS):
+                    error.add_note(
+                        f"Checkpoint replacement retries exhausted. Previous checkpoint: "
+                        f"{destination}; pending checkpoint: {temporary}."
+                    )
+                    raise
+                if attempt == 0:
+                    print(
+                        f"WARNING: Cannot replace pytest checkpoint (WinError "
+                        f"{error.winerror}); retrying without removing {destination}.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                time.sleep(CHECKPOINT_RETRY_DELAYS[attempt])
 
     def failure(self, nodeid, phase, details, sections=()):
         event = {
@@ -195,6 +219,8 @@ def run_tests(source, output):
                 if exit_code == 0
                 else "interrupted"
                 if exit_code == 2
+                else "error"
+                if exit_code == 3
                 else "failed"
             )
             results.update(status=status, exit_code=exit_code)
