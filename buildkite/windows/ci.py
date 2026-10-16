@@ -580,6 +580,26 @@ def test_compiler_environment(architecture, env):
     return prepared
 
 
+def installed_test_packages(python, env):
+    return json.loads(
+        run(
+            [
+                python,
+                "-I",
+                "-c",
+                (
+                    "import importlib.metadata as m, json, re; "
+                    "names = {d.metadata['Name'] for d in m.distributions()}; "
+                    "print(json.dumps({re.sub(r'[-_.]+', '-', n).lower(): m.version(n) "
+                    "for n in names}, sort_keys=True))"
+                ),
+            ],
+            env=env,
+            capture=True,
+        )
+    )
+
+
 def run_full_tests(
     python, venv, source, wheel, work, output, env, architecture, test_suite="full"
 ):
@@ -598,6 +618,11 @@ def run_full_tests(
                 f"Bundled ARM64 TorchVision wheel is missing: {torchvision}"
             )
         test_wheels.append(torchvision)
+    test_utilities = source / "tests" / "vllm_test_utils"
+    if not (test_utilities / "setup.py").is_file():
+        raise FileNotFoundError(
+            f"The selected source has no test utility package: {test_utilities}"
+        )
     compiler_env = test_compiler_environment(architecture, env)
     test_venv = Path(work) / "test-venv"
     run([python, "-I", "-m", "venv", test_venv], cwd=work, env=env)
@@ -613,21 +638,7 @@ def run_full_tests(
     test_env["PATH"] = str(test_python.parent) + os.pathsep + compiler_env["PATH"]
     test_env.pop("PYTHONPATH", None)
     test_env.pop("PYTEST_ADDOPTS", None)
-    install = [
-        test_python,
-        "-m",
-        "pip",
-        "--isolated",
-        "install",
-        "--only-binary=:all:",
-        "-r",
-        HERE / "requirements-tests.txt",
-    ]
-    if env.get("VLLM_WINDOWS_WHEELHOUSE"):
-        install += ["--find-links", env["VLLM_WINDOWS_WHEELHOUSE"]]
-    if env.get("VLLM_WINDOWS_NO_INDEX") == "1":
-        install += ["--no-index"]
-    run(install, cwd=work, env=test_env)
+    # Make the supplied wheels visible before resolving their test dependencies.
     run(
         [
             test_python,
@@ -644,6 +655,70 @@ def run_full_tests(
         cwd=work,
         env=test_env,
     )
+    # This is the pinned checkout's pure-Python helper, not a native dependency.
+    run(
+        [
+            test_python,
+            "-m",
+            "pip",
+            "--isolated",
+            "install",
+            "--no-deps",
+            "--no-build-isolation",
+            "--no-compile",
+            "--ignore-installed",
+            test_utilities,
+        ],
+        cwd=work,
+        env=test_env,
+    )
+    runtime_packages = installed_test_packages(test_python, test_env)
+    if "torch" not in runtime_packages:
+        raise RuntimeError(
+            "The test venv cannot see the provisioned Torch distribution."
+        )
+    constraints = output / "test-runtime-constraints.txt"
+    constraints.write_text(
+        "".join(
+            f"{name}=={version}\n" for name, version in sorted(runtime_packages.items())
+        ),
+        encoding="utf-8",
+    )
+    install = [
+        test_python,
+        "-m",
+        "pip",
+        "--isolated",
+        "install",
+        "--only-binary=:all:",
+        "-c",
+        constraints,
+        "-r",
+        HERE / "requirements-tests.txt",
+    ]
+    if env.get("VLLM_WINDOWS_WHEELHOUSE"):
+        install += ["--find-links", env["VLLM_WINDOWS_WHEELHOUSE"]]
+    if env.get("VLLM_WINDOWS_NO_INDEX") == "1":
+        install += ["--no-index"]
+    run(install, cwd=work, env=test_env)
+    installed_packages = installed_test_packages(test_python, test_env)
+    (output / "test-dependencies.json").write_text(
+        json.dumps(
+            {"protected_runtime": runtime_packages, "installed": installed_packages},
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    changed = {
+        name: {"expected": version, "installed": installed_packages.get(name)}
+        for name, version in runtime_packages.items()
+        if installed_packages.get(name) != version
+    }
+    if changed:
+        raise RuntimeError(
+            f"Test installation changed protected runtime packages: {changed}"
+        )
     shutil.copyfile(HERE / "wheel_imports.py", test_site / "_vllm_ci_wheel_imports.py")
     shutil.copyfile(
         HERE / "windows_helpers.py", test_site / "_vllm_ci_windows_helpers.py"

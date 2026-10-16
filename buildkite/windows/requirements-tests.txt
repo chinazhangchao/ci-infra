@@ -1,6 +1,9 @@
-# Harness and public data/audio wheels for the fork's complete tests tree.
-# Other model/backend dependencies belong in the pool runtime environment;
-# missing dependencies remain test failures.
+# Windows test dependencies derived from requirements/test/cuda.in at:
+# https://github.com/vortex-captain/vllm-windows/tree/bd3dc3d3364a50012bf70b7376010c1b2c89633c
+# The runner constrains the provisioned runtime instead of importing Linux
+# Torch/Transformers/Numba pins. See README.md for native/backend exceptions.
+
+# Test harness.
 pytest>=8,<10
 pytest-asyncio
 pytest-rerunfailures
@@ -9,5 +12,38 @@ pytest-timeout
 pytest-cov
 tblib
 cloudpickle
+
+# Model loading and reference implementations.
+accelerate==1.15.0
+peft>=0.19.1
+sentence-transformers>=5.2.0
+timm>=1.0.17
+open_clip_torch==2.32.0
+vector-quantize-pytorch
+tensorizer==2.10.1
+
+# Data, audio, vision and model-specific test utilities.
 pandas==3.0.6
 soundfile==0.14.0
+backoff
+blobfile
+httpx
+librosa
+jiwer
+num2words
+datamodel-code-generator
+imagehash
+matplotlib
+openpyxl
+plotly
+
+# API, serialization and multiprocessing tests.
+schemathesis>=4.0.0
+cohere>=7.0.0
+multiprocess
+pqdm
+rapidfuzz
+msgpack
+orjson
+hf-xet
+pywin32; sys_platform == "win32"

@@ -88,12 +88,21 @@ but still requires CUDA-enabled Torch and the compiler/toolkit configuration;
 the test job requires a working NVIDIA GPU.
 
 The test job creates a disposable test venv, makes the provisioned pool
-dependencies available through a `.pth`
-file, installs the [pytest harness and test dependencies](requirements-tests.txt),
-and installs the new wheel locally with its console scripts. ARM64 test jobs
-also install the bundled TorchVision wheel into this disposable venv, for both
-`deepgemm` and `full` suites. No packages in the
-pool venv are replaced. The runner checks that vLLM imports from this job's installed wheel,
+dependencies available through a `.pth` file, and installs the new wheel
+locally with its console scripts. ARM64 test jobs also install the bundled
+TorchVision wheel before resolving test dependencies, for both `deepgemm` and
+`full` suites. The pinned checkout's pure-Python `tests\vllm_test_utils` package
+is installed locally, matching the Linux test image.
+
+The runner snapshots the versions visible in this environment and uses them
+as constraints when installing the [Windows test dependencies](requirements-tests.txt).
+This prevents pip from replacing or shadowing the provisioned Torch,
+Transformers, NumPy, Numba, or other runtime packages with different versions.
+A dependency conflict fails setup instead of upgrading the runtime. A second
+snapshot verifies that all protected versions are unchanged before pytest
+starts. No packages in the pool venv are replaced.
+
+The runner checks that vLLM imports from this job's installed wheel,
 not the source checkout or a cached vLLM. Child Python processes receive the
 same package/test paths. A startup import hook, installed only in the disposable
 test venv, resolves `vllm` from that venv even when an upstream subprocess helper
@@ -132,8 +141,10 @@ environment for its native architecture and sets `CC`/`CXX` to that MSVC compile
 On ARM64 it uses `VLLM_WINDOWS_VS_PATH`, `VLLM_WINDOWS_MSVC_VERSION` (default
 `14.51.36231`) and `VLLM_WINDOWS_SDK_VERSION` (default `10.0.26100.0`).
 This supports Triton/Inductor's **runtime JIT**, which still compiles launchers
-and kernels as part of the tests. Dependency installation remains wheel-only;
-the test job does not rebuild vLLM or compile Python dependency packages.
+and kernels as part of the tests. Third-party dependencies remain wheel-only;
+the only source packaging step is the checkout's pure-Python test utility
+package, using the existing build tools without dependency resolution or build
+isolation. The test job does not rebuild vLLM or compile native dependencies.
 Compiler, header or library discovery failures stop setup before pytest starts.
 
 The pipeline's effective pytest invocation is:
@@ -191,6 +202,11 @@ and test runtime:
   print immediately in the Buildkite log, rather than waiting for the full
   suite to end.
 - `pytest.xml` is the normal JUnit report, produced when pytest finishes.
+- `test-runtime-constraints.txt` records the exact protected distribution
+  versions, including the installed vLLM/TorchVision wheels.
+- `test-dependencies.json` records the protected versions and the installed
+  distribution inventory after dependency installation. If versions changed,
+  the report is retained and setup fails before pytest starts.
 
 If pytest is terminated before it can finalize, the last summary and previously
 written failures remain on disk even when JUnit is missing. A summary with
@@ -269,23 +285,47 @@ Leave the variable unset to retain build -> manual approval -> test behavior.
 An existing agent must be available for the upload and test jobs; a waiting
 upload step has not yet created the rest of the pipeline.
 
-**The smoke-test pool is not sufficient for every upstream test.** Full tests
-need compatible packages beyond the pytest harness, including model/audio/video
-dependencies, TorchVision/TorchAudio, OpenCV, and backend-specific libraries.
-Use the selected fork's `requirements\test\cuda.in` as the dependency inventory,
-but do not install its Linux Torch/Numba pins blindly over the provisioned
-NVIDIA Torch. Supply compatible test dependencies in the pool's runtime
-manifest and wheelhouse. Tests may additionally need several GPUs, NCCL,
-Hugging Face access/credentials, large model storage, and external services.
-Some cannot run on Windows ARM64 at all. Full mode deliberately attempts
-the full tree and reports those incompatibilities; it does not claim that
-every test can execute successfully on one ARM64 machine. A root `conftest.py`
-import failure can prevent collection entirely and is a failure, not a skip.
+#### Windows test dependency parity
 
-Pandas 3.0.6 and SoundFile 0.14.0 have public Windows ARM64 wheels and are
-included in `requirements-tests.txt`. Pip installs them into the disposable
-test venv from the configured PyPI index (or mirror), with wheel-only mode
-still enforced. They are not copied into this repository's wheelhouse.
+`requirements-tests.txt` is derived from the fork's
+`requirements\test\cuda.in` at the source revision recorded in its header.
+Unlike the previous harness-only list, it explicitly includes Accelerate
+1.15.0, PEFT, Sentence Transformers, timm, OpenCLIP, Tensorizer, audio/image
+utilities, Cohere, Schemathesis, serialization and multiprocessing packages.
+Pandas 3.0.6 and SoundFile 0.14.0 retain their ARM64-compatible pins.
+Packages come from the configured PyPI index or wheelhouse and are installed
+only in the disposable test venv; they do not need to be added to the pool.
+
+The external dependency graph has been resolved with binary-only packages for
+Windows ARM64 / Python 3.13, with Torch and TorchVision supplied separately.
+This verifies wheel availability, not native DLL/ABI compatibility or every
+model's execution. Actual pool versions are constrained at job runtime.
+Do not copy the Linux lockfile's Torch/Transformers/Numba pins into this file.
+When updating the source revision, review its test requirements, update this
+Windows manifest, and check the full transitive wheel graph, not just the
+top-level package's `py3-none-any` tag.
+
+The manifest deliberately does not pretend the following requirements are
+available on this agent:
+
+| Requirement | Windows ARM64 exception |
+|---|---|
+| `datasets`, `lm-eval`, `mteb` | Their dependency graphs need PyArrow; MTEB also needs `pytrec-eval-terrier`. Compatible public ARM64 wheels are missing. |
+| OpenCV-dependent tests and packages, including `albumentations` and Mistral image extras | No compatible public OpenCV ARM64 wheel. |
+| `cohere-melody` | Its native wheel is unavailable for this target, despite the separate Cohere SDK being supported. |
+| Ray, RunAI Model Streamer, gRPC health/reflection and gRPC-dependent clients | Native packages lack compatible public ARM64 wheels. |
+| TorchAudio, TorchCodec, Vocos, native model/video loaders | Require a separately supported native runtime; they are not installed by substituting Linux/x64 wheels. |
+| FlashInfer, Helion, CUTLASS DSL, Humming, DeepEP, NIXL, AITER and the bitsandbytes plugin | Require additional native libraries, a supported backend/platform, or hardware. A Python wrapper alone is insufficient. |
+| `pytest-forked`, `fcntl`, NCCL | POSIX/distributed runtime requirements, not missing portable Python packages. |
+| Dummy endpoint/stat-logger plugins | Suite-specific packages, not installed globally: their entry points change vLLM behavior. |
+| TerraTorch/Lightning and upstream CI/service-specific tooling | Disabled or separate upstream workflows; not dependencies of this native pytest harness. |
+
+These exceptions are not automatic test skips or success fallbacks. Full mode
+still reports unavailable imports/backends as failures or honors the fork's
+own skip conditions. The pipeline's DeepGEMM-only selection remains unchanged.
+Model access credentials, device memory, multiple GPUs, native DLLs, and
+external services are separate prerequisites. A root `conftest.py` import
+failure remains a failure.
 
 The repository's [`wheelhouse`](wheelhouse/) contains local copies of
 `torchvision-0.29.0a0+10f68db-cp313-cp313-win_arm64.whl` and
@@ -298,17 +338,19 @@ is already present in the pool. NumPy, Torch, and Pillow are inherited from the
 provisioned pool. A missing bundled wheel fails setup; there is no index fallback.
 The ARM64 wheel is not installed in x64 test jobs.
 
-FlashInfer is not automatically installed; provide its runtime requirements and
-wheelhouse path when provisioning if needed. Compatible wheel tags do not
-guarantee TorchVision's ABI compatibility with the selected NVIDIA Torch or
-FlashInfer's Windows/backend support and dependency availability.
+FlashInfer is not automatically installed. Although its bundled wheel is tagged
+`py3-none-any`, it requires packages including `apache-tvm-ffi`, `cuda-python`,
+`cuda-tile`, `nccl4py`, and cuDNN frontend. Supply a supported complete backend
+when provisioning rather than installing the wrapper with missing dependencies.
+Compatible wheel tags also do not guarantee TorchVision's ABI compatibility
+with the selected NVIDIA Torch.
 
 Newly provisioned agents carry `VLLM_WINDOWS_WHEELHOUSE` and
 `VLLM_WINDOWS_NO_INDEX` from the provisioning arguments. Full-test harness
 installation uses that wheelhouse and respects `NoIndex`. For an existing pool,
 set these variables in the trusted agent environment before restarting its
 launcher if they are not in `environment.json` yet. With `NoIndex=1`, include
-the harness/data/audio wheels and their dependencies in the wheelhouse.
+the entire Windows test manifest and its transitive wheels in the wheelhouse.
 
 ## Provision the private pools
 

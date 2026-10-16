@@ -21,9 +21,47 @@ def test_public_data_dependencies_are_installed_from_index():
         if line := raw.split("#", 1)[0].strip():
             requirement = Requirement(line)
             requirements[requirement.name] = requirement
-    for name, version in (("pandas", "3.0.6"), ("soundfile", "0.14.0")):
+    for name, version in (
+        ("accelerate", "1.15.0"),
+        ("pandas", "3.0.6"),
+        ("soundfile", "0.14.0"),
+    ):
         assert str(requirements[name].specifier) == f"=={version}"
         assert requirements[name].url is None
+    assert {
+        "peft",
+        "sentence-transformers",
+        "timm",
+        "tensorizer",
+        "cohere",
+        "schemathesis",
+        "imagehash",
+        "multiprocess",
+        "pqdm",
+        "rapidfuzz",
+        "msgpack",
+        "orjson",
+        "hf-xet",
+        "pywin32",
+    } <= requirements.keys()
+    assert (
+        not {
+            "torch",
+            "torchvision",
+            "torchaudio",
+            "transformers",
+            "tokenizers",
+            "numba",
+            "ray",
+            "datasets",
+            "mteb",
+            "lm-eval",
+            "cohere_melody",
+            "flashinfer-python",
+            "pytest-forked",
+        }
+        & requirements.keys()
+    )
 
 
 @pytest.mark.parametrize("winerror", [5, 32, 33])
@@ -222,14 +260,32 @@ def test_compiler_rejects_invalid_version_arguments(tmp_path, variable, value):
 @pytest.mark.parametrize("architecture", ["x64", "arm64"])
 @pytest.mark.parametrize("test_suite", ["full", "deepgemm"])
 @pytest.mark.parametrize(
-    "failed_phase", [None, "compiler", "harness", "wheel", "pytest"]
+    "failed_phase",
+    [
+        None,
+        "compiler",
+        "harness",
+        "wheel",
+        "utilities",
+        "runtime-missing",
+        "runtime-change",
+        "pytest",
+    ],
 )
 def test_full_suite_setup_preserves_pool_and_failure(
-    tmp_path, monkeypatch, use_wheelhouse, no_index, architecture, failed_phase,
+    tmp_path,
+    monkeypatch,
+    use_wheelhouse,
+    no_index,
+    architecture,
+    failed_phase,
     test_suite,
 ):
     pool = tmp_path / "pool"
     source = tmp_path / "source"
+    utilities = source / "tests" / "vllm_test_utils"
+    utilities.mkdir(parents=True)
+    (utilities / "setup.py").touch()
     output = tmp_path / "artifacts"
     output.mkdir()
     wheel = tmp_path / "vllm.whl"
@@ -242,6 +298,10 @@ def test_full_suite_setup_preserves_pool_and_failure(
     if use_wheelhouse:
         original["VLLM_WINDOWS_WHEELHOUSE"] = str(tmp_path / "wheelhouse with spaces")
     calls = []
+    runtime_queries = 0
+    runtime = {"torch": "2.16.0.dev20261009+cu134", "numpy": "2.5.3"}
+    if architecture == "arm64":
+        runtime["torchvision"] = "0.29.0a0+10f68db"
     compiler_env = {
         **original,
         "PATH": "compiler-path",
@@ -261,8 +321,17 @@ def test_full_suite_setup_preserves_pool_and_failure(
     monkeypatch.setattr(ci, "test_compiler_environment", compiler_environment)
 
     def run(args, **kwargs):
+        nonlocal runtime_queries
         args = [str(arg) for arg in args]
         calls.append((args, kwargs))
+        if "-c" in args and kwargs.get("capture"):
+            runtime_queries += 1
+            if runtime_queries == 1:
+                return json.dumps({} if failed_phase == "runtime-missing" else runtime)
+            installed = {**runtime, "accelerate": "1.15.0"}
+            if failed_phase == "runtime-change":
+                installed["torch"] = "2.13.0"
+            return json.dumps(installed)
         if "venv" in args:
             (Path(args[-1]) / "Lib" / "site-packages").mkdir(parents=True)
         phase = (
@@ -271,6 +340,8 @@ def test_full_suite_setup_preserves_pool_and_failure(
             else (
                 "harness"
                 if "-r" in args
+                else "utilities"
+                if str(utilities) in args
                 else "wheel"
                 if "--no-deps" in args
                 else "venv"
@@ -300,6 +371,22 @@ def test_full_suite_setup_preserves_pool_and_failure(
             test_suite
         )
         return
+    if failed_phase in ("runtime-change", "runtime-missing"):
+        message = (
+            "changed protected runtime packages"
+            if failed_phase == "runtime-change"
+            else "cannot see the provisioned Torch distribution"
+        )
+        with pytest.raises(RuntimeError, match=message):
+            ci.run_full_tests(*args)
+        assert not any(str(ci.HERE / "run_tests.py") in command for command, _ in calls)
+        if failed_phase == "runtime-change":
+            report = json.loads((output / "test-dependencies.json").read_text())
+            assert report["protected_runtime"] == runtime
+            assert report["installed"]["torch"] == "2.13.0"
+        else:
+            assert not any("-r" in command for command, _ in calls)
+        return
     if failed_phase:
         with pytest.raises(subprocess.CalledProcessError) as error:
             ci.run_full_tests(*args)
@@ -312,15 +399,6 @@ def test_full_suite_setup_preserves_pool_and_failure(
         tmp_path / "test-venv" / "Lib" / "site-packages" / "pool-dependencies.pth"
     )
     assert inherited.read_text().strip() == str(pool / "Lib" / "site-packages")
-    harness = calls[1][0]
-    assert "--only-binary=:all:" in harness
-    assert ("--find-links" in harness) == use_wheelhouse
-    if use_wheelhouse:
-        assert (
-            harness[harness.index("--find-links") + 1]
-            == original["VLLM_WINDOWS_WHEELHOUSE"]
-        )
-    assert ("--no-index" in harness) == no_index
     for command, kwargs in calls[1:]:
         assert command[0] == str(tmp_path / "test-venv" / "Scripts" / "python.exe")
         assert "PYTHONPATH" not in kwargs["env"]
@@ -329,24 +407,50 @@ def test_full_suite_setup_preserves_pool_and_failure(
         assert kwargs["env"]["CC"] == "cl.exe"
         assert kwargs["env"]["INCLUDE"] == "msvc-include"
         assert kwargs["env"]["PATH"].endswith(os.pathsep + "compiler-path")
-    if failed_phase == "harness":
-        assert len(calls) == 2
     if failed_phase == "wheel":
+        assert len(calls) == 2
+        return
+    if failed_phase == "utilities":
         assert len(calls) == 3
+        return
+    harness = calls[4][0]
+    assert "--only-binary=:all:" in harness
+    assert ("--find-links" in harness) == use_wheelhouse
+    if use_wheelhouse:
+        assert (
+            harness[harness.index("--find-links") + 1]
+            == original["VLLM_WINDOWS_WHEELHOUSE"]
+        )
+    assert ("--no-index" in harness) == no_index
+    assert harness[harness.index("-c") + 1] == str(
+        output / "test-runtime-constraints.txt"
+    )
+    assert (output / "test-runtime-constraints.txt").read_text().splitlines() == [
+        f"{name}=={version}" for name, version in sorted(runtime.items())
+    ]
+    if failed_phase == "harness":
+        assert len(calls) == 5
     if not failed_phase or failed_phase == "pytest":
-        assert len(calls) == 4
-        assert "--no-deps" in calls[2][0]
-        assert "--only-binary=:all:" in calls[2][0]
-        assert "--no-compile" in calls[2][0]
-        assert "--ignore-installed" in calls[2][0]
-        assert str(wheel) in calls[2][0]
+        assert len(calls) == 7
+        assert runtime_queries == 2
+        assert "--no-deps" in calls[1][0]
+        assert "--only-binary=:all:" in calls[1][0]
+        assert "--no-compile" in calls[1][0]
+        assert "--ignore-installed" in calls[1][0]
+        assert str(wheel) in calls[1][0]
         torchvision = (
             ci.HERE
             / "wheelhouse"
             / "torchvision-0.29.0a0+10f68db-cp313-cp313-win_arm64.whl"
         )
-        assert (str(torchvision) in calls[2][0]) == (architecture == "arm64")
-        assert not any("flashinfer" in arg for arg in calls[2][0])
+        assert (str(torchvision) in calls[1][0]) == (architecture == "arm64")
+        assert not any("flashinfer" in arg for arg in calls[1][0])
+        assert str(utilities) in calls[2][0]
+        assert "--no-deps" in calls[2][0]
+        assert "--no-build-isolation" in calls[2][0]
+        report = json.loads((output / "test-dependencies.json").read_text())
+        assert report["protected_runtime"] == runtime
+        assert report["installed"] == {**runtime, "accelerate": "1.15.0"}
         assert calls[-1][0][1:3] == ["-I", str(ci.HERE / "run_tests.py")]
         assert calls[-1][0][-2:] == ["--test-suite", test_suite]
         assert calls[-1][1]["cwd"] == source
@@ -361,7 +465,9 @@ def test_full_suite_setup_preserves_pool_and_failure(
         ).read_text()
 
 
-def test_missing_bundled_torchvision_fails_before_environment_setup(tmp_path, monkeypatch):
+def test_missing_bundled_torchvision_fails_before_environment_setup(
+    tmp_path, monkeypatch
+):
     monkeypatch.setattr(ci, "HERE", tmp_path / "ci")
     compiler = Mock()
     runner = Mock()
@@ -370,6 +476,26 @@ def test_missing_bundled_torchvision_fails_before_environment_setup(tmp_path, mo
     with pytest.raises(
         FileNotFoundError, match="Bundled ARM64 TorchVision wheel is missing"
     ):
+        ci.run_full_tests(
+            tmp_path / "python.exe",
+            tmp_path / "pool",
+            tmp_path / "source",
+            tmp_path / "vllm.whl",
+            tmp_path,
+            tmp_path,
+            {},
+            "arm64",
+        )
+    compiler.assert_not_called()
+    runner.assert_not_called()
+
+
+def test_missing_source_test_utilities_fail_before_setup(tmp_path, monkeypatch):
+    compiler = Mock()
+    runner = Mock()
+    monkeypatch.setattr(ci, "test_compiler_environment", compiler)
+    monkeypatch.setattr(ci, "run", runner)
+    with pytest.raises(FileNotFoundError, match="no test utility package"):
         ci.run_full_tests(
             tmp_path / "python.exe",
             tmp_path / "pool",
@@ -471,6 +597,22 @@ def prepare_full_runner(tmp_path):
     env["PYTEST_ADDOPTS"] = "-x -k nonexistent"
     env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
     return python, source, tests, output, env
+
+
+def test_dependency_snapshot_prefers_local_versions_over_shared_pool(tmp_path):
+    python, _source, _tests, _output, env = prepare_full_runner(tmp_path)
+    site = next(python.parent.parent.rglob("_vllm_ci_wheel_imports.py")).parent
+    shared = tmp_path / "shared-packages"
+    for directory, version in ((site, "2.0"), (shared, "1.0")):
+        metadata = directory / f"ci_runtime_probe-{version}.dist-info"
+        metadata.mkdir(parents=True)
+        (metadata / "METADATA").write_text(
+            f"Metadata-Version: 2.1\nName: ci_runtime_probe\nVersion: {version}\n"
+        )
+    (site / "shared-probe.pth").write_text(str(shared) + "\n")
+    packages = ci.installed_test_packages(python, env)
+    assert packages["ci-runtime-probe"] == "2.0"
+    assert "ci_runtime_probe" not in packages
 
 
 @pytest.mark.parametrize("test_failure", [False, True])
