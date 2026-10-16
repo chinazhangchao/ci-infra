@@ -69,6 +69,21 @@ def test_public_data_dependencies_are_installed_from_index():
         }
         & requirements.keys()
     )
+    assert "0.9.2" not in requirements["librosa"].specifier
+    assert "0.10.0" in requirements["librosa"].specifier
+    assert "0.3.1" not in requirements["soxr"].specifier
+    assert "0.3.2" in requirements["soxr"].specifier
+    for name in ("librosa", "soxr"):
+        for platform, machine, expected in (
+            ("win32", "ARM64", False),
+            ("win32", "arm64", False),
+            ("win32", "AMD64", True),
+            ("linux", "aarch64", True),
+            ("linux", "x86_64", True),
+        ):
+            assert requirements[name].marker.evaluate(
+                {"sys_platform": platform, "platform_machine": machine}
+            ) == expected
 
 
 @pytest.mark.parametrize("winerror", [5, 32, 33])

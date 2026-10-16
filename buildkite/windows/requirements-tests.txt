@@ -28,7 +28,10 @@ soundfile==0.14.0
 backoff
 blobfile
 httpx
-librosa
+# Transformers imports Soxr when Librosa is present. Do not backtrack to
+# Librosa 0.9.x on Windows ARM64, where no compatible Soxr wheel exists.
+librosa>=0.10.0; sys_platform != "win32" or (platform_machine != "ARM64" and platform_machine != "arm64")
+soxr>=0.3.2; sys_platform != "win32" or (platform_machine != "ARM64" and platform_machine != "arm64")
 jiwer
 num2words
 datamodel-code-generator

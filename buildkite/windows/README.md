@@ -316,6 +316,7 @@ available on this agent:
 
 | Requirement | Windows ARM64 exception |
 |---|---|
+| Librosa/Soxr | Soxr has no public Windows ARM64 wheel. Both are excluded on this target: allowing pip to backtrack to Librosa 0.9.2 enables Transformers' audio imports without supplying Soxr and prevents even non-audio test collection. Other platforms require Librosa >=0.10.0 and Soxr >=0.3.2. |
 | `datasets`, `lm-eval`, `mteb` | Their dependency graphs need PyArrow; MTEB also needs `pytrec-eval-terrier`. Compatible public ARM64 wheels are missing. |
 | OpenCV-dependent tests and packages, including `albumentations` and Mistral image extras | No compatible public OpenCV ARM64 wheel. |
 | `cohere-melody` | Its native wheel is unavailable for this target, despite the separate Cohere SDK being supported. |
