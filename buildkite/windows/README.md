@@ -89,9 +89,10 @@ the test job requires a working NVIDIA GPU.
 
 The test job creates a disposable test venv, makes the provisioned pool
 dependencies available through a `.pth` file, and installs the new wheel
-locally with its console scripts. ARM64 test jobs also install the bundled
-TorchVision wheel before resolving test dependencies, for both `deepgemm` and
-`full` suites. The pinned checkout's pure-Python `tests\vllm_test_utils` package
+locally with its console scripts. ARM64 test jobs select and install TorchVision
+from the same NVIDIA nightly index used to provision Torch before resolving
+test dependencies, for both `deepgemm` and `full` suites. The pinned checkout's
+pure-Python `tests\vllm_test_utils` package
 is installed locally, matching the Linux test image.
 
 The runner snapshots the versions visible in this environment and uses them
@@ -207,6 +208,11 @@ and test runtime:
 - `test-dependencies.json` records the protected versions and the installed
   distribution inventory after dependency installation. If versions changed,
   the report is retained and setup fails before pytest starts.
+- `torchvision-selection.json` records the NVIDIA wheel's version, source URL
+  and SHA-256. ARM64 jobs validate its origin and platform before installation.
+- `torchvision-smoke.json` records a successful native CPU NMS check against
+  the provisioned Torch. Import/ABI/operator failures stop setup before pytest
+  and do not produce a success report.
 
 If pytest is terminated before it can finalize, the last summary and previously
 written failures remain on disk even when JUnit is missing. A summary with
@@ -327,18 +333,30 @@ Model access credentials, device memory, multiple GPUs, native DLLs, and
 external services are separate prerequisites. A root `conftest.py` import
 failure remains a failure.
 
-The repository's [`wheelhouse`](wheelhouse/) contains local copies of
-`torchvision-0.29.0a0+10f68db-cp313-cp313-win_arm64.whl` and
-`flashinfer_python-0.6.17-py3-none-any.whl`, matching missing imports in build 16.
-This is not a complete test wheelhouse. ARM64 test jobs explicitly install this
-TorchVision wheel alongside vLLM into the disposable test venv, regardless of
-`VLLM_WINDOWS_WHEELHOUSE`. Installation uses `--no-deps` to preserve the pool's
-NVIDIA Torch and `--ignore-installed` to ensure a local copy even if TorchVision
-is already present in the pool. NumPy, Torch, and Pillow are inherited from the
-provisioned pool. A missing bundled wheel fails setup; there is no index fallback.
-The ARM64 wheel is not installed in x64 test jobs.
+TorchVision is not bundled in the repository. ARM64 test jobs select the latest
+compatible prerelease wheel from
+[`https://pypi.nvidia.cn/nvtorch_oot_nightly/`](https://pypi.nvidia.cn/nvtorch_oot_nightly/),
+the same index used for Torch provisioning. Selection is wheel-only and ignores
+installed TorchVision and the general package index. The runner validates the
+NVIDIA source URL, ARM64 wheel tag and SHA-256, then installs that exact hashed
+URL alongside vLLM into the disposable venv. There is no fallback to PyPI, the
+repository wheelhouse, or a source build.
 
-FlashInfer is not automatically installed. Although its bundled wheel is tagged
+Installation uses `--no-deps` to preserve the pool's NVIDIA Torch and
+`--ignore-installed` to ensure the selected TorchVision is local to the test
+venv. NumPy, Torch, and Pillow are inherited from the pool. The runner imports
+TorchVision and executes native CPU NMS before installing the remaining test
+dependencies, catching missing operators or incompatible C++ binaries early.
+It does not replace Torch or fabricate missing operators to make this check
+pass. x64 jobs do not use this ARM64-specific selection.
+
+As with Torch provisioning, `VLLM_WINDOWS_NO_INDEX=1` applies to the general
+dependency install, not this explicit NVIDIA selection. NVIDIA access is
+required even when the remaining test dependencies use an offline wheelhouse.
+
+The repository's [`wheelhouse`](wheelhouse/) retains
+`flashinfer_python-0.6.17-py3-none-any.whl`. This is not a complete test wheelhouse,
+and FlashInfer is not automatically installed. Although its wheel is tagged
 `py3-none-any`, it requires packages including `apache-tvm-ffi`, `cuda-python`,
 `cuda-tile`, `nccl4py`, and cuDNN frontend. Supply a supported complete backend
 when provisioning rather than installing the wrapper with missing dependencies.

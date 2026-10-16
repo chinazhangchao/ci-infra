@@ -12,6 +12,13 @@ import pytest
 
 from buildkite.windows import ci, run_tests
 
+NVIDIA_VISION_VERSION = "0.30.0.dev20261015+cu134"
+NVIDIA_VISION_URL = (
+    "https://pypi.nvidia.cn/nvtorch_oot_nightly/torchvision/"
+    "torchvision-0.30.0.dev20261015%2Bcu134-py3-none-win_arm64.whl"
+)
+NVIDIA_VISION_HASH = "a" * 64
+
 
 def test_public_data_dependencies_are_installed_from_index():
     from packaging.requirements import Requirement
@@ -301,7 +308,13 @@ def test_full_suite_setup_preserves_pool_and_failure(
     runtime_queries = 0
     runtime = {"torch": "2.16.0.dev20261009+cu134", "numpy": "2.5.3"}
     if architecture == "arm64":
-        runtime["torchvision"] = "0.29.0a0+10f68db"
+        runtime["torchvision"] = NVIDIA_VISION_VERSION
+    selected_vision = Mock(
+        return_value=f"{NVIDIA_VISION_URL}#sha256={NVIDIA_VISION_HASH}"
+    )
+    vision_probe = Mock()
+    monkeypatch.setattr(ci, "select_nvidia_torchvision", selected_vision)
+    monkeypatch.setattr(ci, "probe_torchvision", vision_probe)
     compiler_env = {
         **original,
         "PATH": "compiler-path",
@@ -438,12 +451,20 @@ def test_full_suite_setup_preserves_pool_and_failure(
         assert "--no-compile" in calls[1][0]
         assert "--ignore-installed" in calls[1][0]
         assert str(wheel) in calls[1][0]
-        torchvision = (
-            ci.HERE
-            / "wheelhouse"
-            / "torchvision-0.29.0a0+10f68db-cp313-cp313-win_arm64.whl"
+        assert (f"{NVIDIA_VISION_URL}#sha256={NVIDIA_VISION_HASH}" in calls[1][0]) == (
+            architecture == "arm64"
         )
-        assert (str(torchvision) in calls[1][0]) == (architecture == "arm64")
+        assert (
+            selected_vision.call_count
+            == vision_probe.call_count
+            == int(architecture == "arm64")
+        )
+        if architecture == "arm64":
+            assert selected_vision.call_args.args[:2] == (
+                tmp_path / "test-venv" / "Scripts" / "python.exe",
+                output,
+            )
+            assert vision_probe.call_args.args[:2] == selected_vision.call_args.args[:2]
         assert not any("flashinfer" in arg for arg in calls[1][0])
         assert str(utilities) in calls[2][0]
         assert "--no-deps" in calls[2][0]
@@ -465,29 +486,166 @@ def test_full_suite_setup_preserves_pool_and_failure(
         ).read_text()
 
 
-def test_missing_bundled_torchvision_fails_before_environment_setup(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        None,
+        "wrong-origin",
+        "http",
+        "wrong-directory",
+        "x64-wheel",
+        "missing-hash",
+        "wrong-package",
+        "invalid-version",
+        "multiple",
+        "empty",
+        "invalid-report",
+    ],
+)
+def test_nvidia_torchvision_selection_pins_source_and_hash(
+    tmp_path, monkeypatch, invalid
 ):
-    monkeypatch.setattr(ci, "HERE", tmp_path / "ci")
-    compiler = Mock()
-    runner = Mock()
-    monkeypatch.setattr(ci, "test_compiler_environment", compiler)
+    package = {
+        "metadata": {"name": "torchvision", "version": NVIDIA_VISION_VERSION},
+        "download_info": {
+            "url": NVIDIA_VISION_URL,
+            "archive_info": {"hashes": {"sha256": NVIDIA_VISION_HASH}},
+        },
+    }
+    report = {"install": [package]}
+    if invalid == "wrong-origin":
+        package["download_info"]["url"] = NVIDIA_VISION_URL.replace(
+            "pypi.nvidia.cn", "example.org"
+        )
+    elif invalid == "http":
+        package["download_info"]["url"] = NVIDIA_VISION_URL.replace("https:", "http:")
+    elif invalid == "wrong-directory":
+        package["download_info"]["url"] = NVIDIA_VISION_URL.replace(
+            "/torchvision/", "/torch/"
+        )
+    elif invalid == "x64-wheel":
+        package["download_info"]["url"] = NVIDIA_VISION_URL.replace(
+            "win_arm64", "win_amd64"
+        )
+    elif invalid == "missing-hash":
+        package["download_info"]["archive_info"] = {}
+    elif invalid == "wrong-package":
+        package["metadata"]["name"] = "torch"
+    elif invalid == "invalid-version":
+        package["metadata"]["version"] = "0.30\nother-package"
+    elif invalid == "multiple":
+        report["install"].append(package)
+    elif invalid == "empty":
+        report["install"] = []
+    elif invalid == "invalid-report":
+        report = []
+    env = {"VLLM_WINDOWS_NO_INDEX": "1"}
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append(args)
+        assert kwargs["env"] is env
+        assert args[:3] == ["venv-python.exe", "-I", "-m"]
+        assert args[-1] == "torchvision"
+        assert args[args.index("--index-url") + 1] == ci.NVIDIA_TORCH_INDEX
+        assert {
+            "--dry-run",
+            "--ignore-installed",
+            "--no-deps",
+            "--pre",
+            "--only-binary=:all:",
+        } <= set(args)
+        assert not {"--extra-index-url", "--find-links", "--no-index"} & set(args)
+        Path(args[args.index("--report") + 1]).write_text(json.dumps(report))
+
+    monkeypatch.setattr(ci, "run", run)
+    if invalid:
+        with pytest.raises(ValueError):
+            ci.select_nvidia_torchvision("venv-python.exe", tmp_path, env)
+    else:
+        assert ci.select_nvidia_torchvision("venv-python.exe", tmp_path, env) == (
+            f"{NVIDIA_VISION_URL}#sha256={NVIDIA_VISION_HASH}"
+        )
+    assert len(calls) == 1
+
+
+def test_nvidia_torchvision_selection_failure_has_no_fallback(tmp_path, monkeypatch):
+    runner = Mock(side_effect=subprocess.CalledProcessError(1, ["pip"]))
     monkeypatch.setattr(ci, "run", runner)
-    with pytest.raises(
-        FileNotFoundError, match="Bundled ARM64 TorchVision wheel is missing"
-    ):
+    with pytest.raises(subprocess.CalledProcessError):
+        ci.select_nvidia_torchvision("venv-python.exe", tmp_path, {})
+    runner.assert_called_once()
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_torchvision_probe_records_native_success_only(tmp_path, monkeypatch, fail):
+    result = {
+        "torch": "2.16.0.dev20261009+cu134",
+        "torchvision": NVIDIA_VISION_VERSION,
+        "nms": "passed",
+    }
+    runner = Mock(
+        side_effect=subprocess.CalledProcessError(1, ["torchvision-probe"])
+        if fail
+        else None,
+        return_value=json.dumps(result),
+    )
+    monkeypatch.setattr(ci, "run", runner)
+    if fail:
+        with pytest.raises(subprocess.CalledProcessError):
+            ci.probe_torchvision("venv-python.exe", tmp_path, {})
+        assert not (tmp_path / "torchvision-smoke.json").exists()
+    else:
+        ci.probe_torchvision("venv-python.exe", tmp_path, {})
+        assert json.loads((tmp_path / "torchvision-smoke.json").read_text()) == result
+    assert "torchvision.ops.nms" in runner.call_args.args[0][-1]
+    assert "device='cpu'" in runner.call_args.args[0][-1]
+
+
+@pytest.mark.parametrize("failure", ["selection", "probe"])
+def test_torchvision_failure_stops_setup_before_test_dependencies(
+    tmp_path, monkeypatch, failure
+):
+    source = tmp_path / "source"
+    utilities = source / "tests" / "vllm_test_utils"
+    utilities.mkdir(parents=True)
+    (utilities / "setup.py").touch()
+    monkeypatch.setattr(ci, "test_compiler_environment", lambda *args: {"PATH": ""})
+    selected = Mock(
+        side_effect=subprocess.CalledProcessError(1, ["selection"])
+        if failure == "selection"
+        else None,
+        return_value=f"{NVIDIA_VISION_URL}#sha256={NVIDIA_VISION_HASH}",
+    )
+    probe = Mock(side_effect=subprocess.CalledProcessError(1, ["probe"]))
+    monkeypatch.setattr(ci, "select_nvidia_torchvision", selected)
+    monkeypatch.setattr(ci, "probe_torchvision", probe)
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append(args)
+        if "venv" in args:
+            (Path(args[-1]) / "Lib" / "site-packages").mkdir(parents=True)
+
+    monkeypatch.setattr(ci, "run", run)
+    with pytest.raises(subprocess.CalledProcessError):
         ci.run_full_tests(
             tmp_path / "python.exe",
             tmp_path / "pool",
-            tmp_path / "source",
+            source,
             tmp_path / "vllm.whl",
             tmp_path,
             tmp_path,
             {},
             "arm64",
         )
-    compiler.assert_not_called()
-    runner.assert_not_called()
+    assert not any("-r" in args for args in calls)
+    assert not any(ci.HERE / "run_tests.py" in args for args in calls)
+    assert probe.call_count == int(failure == "probe")
+
+
+def test_wheelhouse_does_not_bundle_torchvision():
+    assert not list((ci.HERE / "wheelhouse").glob("torchvision-*.whl"))
 
 
 def test_missing_source_test_utilities_fail_before_setup(tmp_path, monkeypatch):

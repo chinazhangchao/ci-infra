@@ -71,7 +71,8 @@ triton-windows==3.8.0.post29
 winloop>=0.7.2
 portalocker
 
-# The fork excludes x64-only TorchAudio/TorchVision, xformers, FlashInfer,
+# TorchVision is selected from NVIDIA's Torch index in disposable test venvs.
+# The fork excludes x64-only TorchAudio, xformers, FlashInfer,
 # PyNvVideoCodec, torchcodec, TVM-FFI, cuDNN frontend and Humming on ARM64.
 # TileLang and InstantTensor are optional accelerators/loaders without public
 # Windows ARM64 wheels; they are not used by this pipeline's CUDA kernel smoke.

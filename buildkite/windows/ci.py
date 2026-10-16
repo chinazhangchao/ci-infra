@@ -11,6 +11,7 @@ import sys
 import tempfile
 import zipfile
 from pathlib import Path
+from urllib.parse import urlsplit
 
 REPOSITORY = "https://github.com/vortex-captain/vllm-windows.git"
 DEFAULT_BRANCH = "v029_win_arm64"
@@ -18,6 +19,7 @@ SOURCE_KEY = "windows-vllm-source"
 HERE = Path(__file__).resolve().parent
 PLATFORMS = {"x64": "win_amd64", "arm64": "win_arm64"}
 TEST_BUILD_ID_ENV = "VLLM_WINDOWS_TEST_BUILD_ID"
+NVIDIA_TORCH_INDEX = "https://pypi.nvidia.cn/nvtorch_oot_nightly/"
 ARM64_OPTIONS = {
     "VLLM_WINDOWS_VS_PATH": "VisualStudioPath",
     "VLLM_WINDOWS_MSVC_VERSION": "MsvcToolsetVersion",
@@ -600,24 +602,112 @@ def installed_test_packages(python, env):
     )
 
 
+def select_nvidia_torchvision(python, output, env):
+    report_path = output / "torchvision-selection.json"
+    run(
+        [
+            python,
+            "-I",
+            "-m",
+            "pip",
+            "--isolated",
+            "--disable-pip-version-check",
+            "install",
+            "--dry-run",
+            "--ignore-installed",
+            "--no-deps",
+            "--pre",
+            "--only-binary=:all:",
+            "--index-url",
+            NVIDIA_TORCH_INDEX,
+            "--report",
+            report_path,
+            "torchvision",
+        ],
+        env=env,
+    )
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    packages = report.get("install") if isinstance(report, dict) else None
+    if (
+        not isinstance(packages, list)
+        or len(packages) != 1
+        or not isinstance(packages[0], dict)
+    ):
+        raise ValueError("NVIDIA TorchVision selection must contain exactly one wheel.")
+    package = packages[0]
+    metadata = package.get("metadata", {})
+    download = package.get("download_info", {})
+    if not isinstance(metadata, dict) or not isinstance(download, dict):
+        raise ValueError("Invalid NVIDIA TorchVision selection metadata.")
+    version = metadata.get("version")
+    url = download.get("url")
+    archive = download.get("archive_info", {})
+    hashes = archive.get("hashes", {}) if isinstance(archive, dict) else {}
+    digest = hashes.get("sha256") if isinstance(hashes, dict) else None
+    if (
+        metadata.get("name") != "torchvision"
+        or not isinstance(version, str)
+        or not re.fullmatch(r"\d[0-9A-Za-z.!+_-]*", version)
+        or not isinstance(url, str)
+        or not isinstance(digest, str)
+        or not re.fullmatch(r"[0-9a-fA-F]{64}", digest)
+    ):
+        raise ValueError("Invalid NVIDIA TorchVision wheel identity or SHA-256.")
+    parsed = urlsplit(url)
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != "pypi.nvidia.cn"
+        or not parsed.path.startswith("/nvtorch_oot_nightly/torchvision/")
+        or not parsed.path.endswith("-win_arm64.whl")
+    ):
+        raise ValueError(
+            "Expected a Windows ARM64 TorchVision wheel from NVIDIA's index."
+        )
+    print(
+        f"Selected NVIDIA TorchVision {version}; provisioned Torch is unchanged.",
+        flush=True,
+    )
+    return parsed._replace(fragment=f"sha256={digest}").geturl()
+
+
+def probe_torchvision(python, output, env):
+    result = json.loads(
+        run(
+            [
+                python,
+                "-I",
+                "-c",
+                "import json, os, sys\n"
+                "from pathlib import Path\n"
+                "os.environ['TORCHVISION_WARN_WHEN_EXTENSION_LOADING_FAILS'] = '1'\n"
+                "import torch, torchvision\n"
+                "package = Path(torchvision.__file__).resolve()\n"
+                "if not package.is_relative_to(Path(sys.prefix).resolve()):\n"
+                "    raise RuntimeError(f'TorchVision must load from the test venv: {package}')\n"
+                "boxes = torch.tensor([[0., 0., 1., 1.], [0., 0., 1., 1.]], device='cpu')\n"
+                "scores = torch.tensor([0.9, 0.5], device='cpu')\n"
+                "kept = torchvision.ops.nms(boxes, scores, 0.5).tolist()\n"
+                "if kept != [0]:\n"
+                "    raise RuntimeError(f'TorchVision native NMS failed: {kept}')\n"
+                "print(json.dumps(dict(torch=torch.__version__, "
+                "torchvision=torchvision.__version__, package=str(package), "
+                "cuda=torch.version.cuda, nms='passed')))\n",
+            ],
+            env=env,
+            capture=True,
+        )
+    )
+    (output / "torchvision-smoke.json").write_text(
+        json.dumps(result, indent=2) + "\n", encoding="utf-8"
+    )
+
+
 def run_full_tests(
     python, venv, source, wheel, work, output, env, architecture, test_suite="full"
 ):
     summary_path = output / "pytest-summary.json"
     summary = {"suite": test_suite, "status": "preparing-test-environment"}
     summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
-    test_wheels = [wheel]
-    if architecture == "arm64":
-        torchvision = (
-            HERE
-            / "wheelhouse"
-            / "torchvision-0.29.0a0+10f68db-cp313-cp313-win_arm64.whl"
-        )
-        if not torchvision.is_file():
-            raise FileNotFoundError(
-                f"Bundled ARM64 TorchVision wheel is missing: {torchvision}"
-            )
-        test_wheels.append(torchvision)
     test_utilities = source / "tests" / "vllm_test_utils"
     if not (test_utilities / "setup.py").is_file():
         raise FileNotFoundError(
@@ -638,6 +728,9 @@ def run_full_tests(
     test_env["PATH"] = str(test_python.parent) + os.pathsep + compiler_env["PATH"]
     test_env.pop("PYTHONPATH", None)
     test_env.pop("PYTEST_ADDOPTS", None)
+    test_wheels = [wheel]
+    if architecture == "arm64":
+        test_wheels.append(select_nvidia_torchvision(test_python, output, test_env))
     # Make the supplied wheels visible before resolving their test dependencies.
     run(
         [
@@ -655,6 +748,8 @@ def run_full_tests(
         cwd=work,
         env=test_env,
     )
+    if architecture == "arm64":
+        probe_torchvision(test_python, output, test_env)
     # This is the pinned checkout's pure-Python helper, not a native dependency.
     run(
         [
