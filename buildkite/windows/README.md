@@ -9,7 +9,8 @@ Existing Linux pipelines and the Linux-oriented pipeline generator are unchanged
 For **ARM64 only**, upload
 [windows-arm64.yml](../../.buildkite/pipelines/windows-arm64.yml) instead.
 It builds the wheel, pauses for **manual approval**, then runs a separate job
-attempting the **entire fork `tests` pytest tree, including optional tests**.
+running **only the DeepGEMM SiLU/FP8 reference-scale test module**.
+Model-memory-budget, model/server, and distributed test suites are not collected.
 Tests can be retried without recompiling. This preserves the combined pipeline's
 smoke-test and x64 settings and requires only an ARM64 queue.
 
@@ -32,7 +33,7 @@ The core extension may be the fork's `_C_stable_libtorch.pyd` or the legacy
 loaded extension belongs to the newly installed wheel, records its module name
 in `smoke.json`, and runs `_C.silu_and_mul` for either layout.
 
-### Full ARM64 pytest suite
+### ARM64 pytest suites
 
 `windows-arm64.yml` has four ordered steps:
 
@@ -40,12 +41,39 @@ in `smoke.json`, and runs `_C.silu_and_mul` for either layout.
 2. **Build CUDA wheel:** `ci.py build --architecture arm64 --test-suite none`
    compiles and validates the wheel, then uploads the wheel, SHA-256 sidecar,
    source/runtime metadata and `build-manifest.json`. It runs no tests.
-3. **Run full ARM64 test suite:** a manual approval block after the build
+3. **Run DeepGEMM ARM64 tests:** a manual approval block after the build
    succeeds. The pipeline can remain here until you are ready to test.
-4. **Full pytest suite:** `ci.py test --architecture arm64` downloads artifacts
-   from the recorded producer job ID in the **same Buildkite build**, verifies
+4. **DeepGEMM pytest suite:** `ci.py test --architecture arm64 --test-suite deepgemm`
+   downloads artifacts from the recorded producer job ID in the **same Buildkite build**, verifies
    both manifest and wheel checksums, and checks out tests from the wheel's
    exact source SHA. It never invokes the vLLM build helper.
+
+The `deepgemm` selection runs every parametrization in
+`tests\kernels\moe\test_silu_mul_fp8_quant_deep_gemm.py` in a fresh test process,
+without first collecting or executing other test modules. Ancestor
+`conftest.py` files still apply. Excluded suites are **not collected**, rather
+than counted as pytest skips or passes. A missing selected module is an error;
+there is no fallback to the full suite.
+
+This isolates the reference-scale failure seen in
+`test_silu_mul_fp8_quant_deep_gemm[1-4-128-fp8_type1]`. The runner sets
+`CUDA_LAUNCH_BLOCKING=1` before importing vLLM, and enables verbose test IDs
+and long tracebacks so asynchronous CUDA errors surface at the failing launch.
+It does not patch the test's reference tensors or the installed wheel:
+uninitialized inactive reference-scale rows remain a hypothesis to confirm,
+not a silently applied fix. Tests within the selected module still share one
+process; a fatal CUDA error aborts its remaining cases after teardown.
+
+The complete fork `tests` tree, including optional tests, remains available
+explicitly with:
+
+```powershell
+python buildkite\windows\ci.py test --architecture arm64 --test-suite full
+```
+
+The standalone CLI and `run_tests.py` retain `full` as their default for
+compatibility; the ARM64 pipeline explicitly selects `deepgemm`. Full mode
+does not force synchronous CUDA launches.
 
 Build and test jobs can run on different provisioned ARM64 agents; they do not
 share a filesystem. The test agent must match the recorded Python major/minor,
@@ -62,7 +90,9 @@ the test job requires a working NVIDIA GPU.
 The test job creates a disposable test venv, makes the provisioned pool
 dependencies available through a `.pth`
 file, installs the [pytest harness and test dependencies](requirements-tests.txt),
-and installs the new wheel locally with its console scripts. No packages in the
+and installs the new wheel locally with its console scripts. ARM64 test jobs
+also install the bundled TorchVision wheel into this disposable venv, for both
+`deepgemm` and `full` suites. No packages in the
 pool venv are replaced. The runner checks that vLLM imports from this job's installed wheel,
 not the source checkout or a cached vLLM. Child Python processes receive the
 same package/test paths. A startup import hook, installed only in the disposable
@@ -106,23 +136,33 @@ and kernels as part of the tests. Dependency installation remains wheel-only;
 the test job does not rebuild vLLM or compile Python dependency packages.
 Compiler, header or library discovery failures stop setup before pytest starts.
 
-The effective pytest invocation is:
+The pipeline's effective pytest invocation is:
+
+```powershell
+$env:CUDA_LAUNCH_BLOCKING = "1"
+pytest tests\kernels\moe\test_silu_mul_fp8_quant_deep_gemm.py `
+    --optional --continue-on-collection-errors --maxfail=0 `
+    --import-mode=append -o addopts= -o pythonpath= --tb=long -ra -vv `
+    --junitxml=<artifacts>\pytest.xml
+```
+
+With `--test-suite full`, the effective invocation remains:
 
 ```powershell
 pytest tests --optional --continue-on-collection-errors --maxfail=0 `
     --import-mode=append -o addopts= -o pythonpath= --tb=short -ra --junitxml=<artifacts>\pytest.xml
 ```
 
-There are no directory/marker filters or automatic Windows-specific exclusions.
+Full mode has no directory/marker filters or automatic Windows-specific exclusions.
 Inherited `PYTEST_ADDOPTS` and configured `addopts` are cleared. Collection
 errors remain failures, but do not prevent otherwise collectable tests from
 running. The fork's own skip/xfail conditions still apply. Pytest failures,
 collection errors, and initialization errors fail the Buildkite job.
 The exception to continuing after failures is a failed test reporting CUDA
-out-of-memory, illegal-memory-access, device-side-assert or sticky-context
-errors: after that test's teardown, the runner aborts with exit code 1 instead
+out-of-memory, illegal-memory-access, launch-failure, device-side-assert or
+sticky-context errors: after that test's teardown, the runner aborts with exit code 1 instead
 of running further tests against an exhausted or poisoned CUDA context.
-The full tree remains selected; unexecuted tests are not reported as passed
+Only the requested suite is selected; unexecuted tests are not reported as passed
 or skipped. Expected errors caught by tests do not trigger this guard.
 This invokes the Python pytest tree, not upstream CI's separate shell scripts,
 Rust cargo tests, or a matrix of CUDA/ROCm/TPU machines.
@@ -133,8 +173,9 @@ directory, alongside a copy of the verified build manifest, producer reference,
 and test runtime:
 
 - `pytest-summary.json` is checkpointed during collection and test execution.
-  It records collected/completed tests, passes, failed reports (including
-  setup/teardown), skips, collection errors, the active test and the final
+  It records the selected `suite`, `selected_paths`, effective
+  `cuda_launch_blocking` setting, collected/completed tests, passes, failed
+  reports (including setup/teardown), skips, collection errors, the active test and the final
   pytest exit code. CUDA resource/context failures also record `stop_reason`
   and finish with `status: aborted`, distinguishing an incomplete suite from
   an ordinary completed run with failures.
@@ -167,10 +208,10 @@ or insufficient GPU memory; those remain explicit failures, not automatic skips.
 Build and test have independent timeouts of 6 hours and 24 hours respectively;
 the combined pipeline's timeouts are unchanged.
 
-After a successful build, click **Run full ARM64 test suite** in Buildkite to
-release the test job. Automatic Buildkite retries are disabled for the full-test
+After a successful build, click **Run DeepGEMM ARM64 tests** in Buildkite to
+release the test job. Automatic Buildkite retries are disabled for the test
 job, including agent-loss failures; the build job's one-time infrastructure
-retry is unchanged. To retry failures manually, retry **Full pytest suite (arm64)**
+retry is unchanged. To retry failures manually, retry **DeepGEMM pytest suite (arm64)**
 only, not the build job or the entire build. It downloads the saved wheel
 again and uses a fresh test checkout/venv. Artifact retention must cover the
 delay before testing. Deliberately retrying the producer build replaces its
@@ -194,13 +235,15 @@ In Buildkite **New Build**, use the current ci-infra branch/commit so the test
 job receives the latest runner fixes, and put the variable above in the build's
 environment variables. Keep the pipeline's initial upload command unchanged.
 When `windows-arm64.yml` is uploaded, it skips source resolution, wheel
-compilation, and the approval block. **Full pytest suite (arm64)** runs directly
-against the prior wheel. Automatic test-job retries remain disabled.
+compilation, and the approval block. **DeepGEMM pytest suite (arm64)** runs directly
+against the prior wheel, collecting only the selected module. Automatic
+test-job retries remain disabled.
 
 The test command can also select the source explicitly inside a Buildkite job:
 
 ```powershell
-python buildkite\windows\ci.py test --architecture arm64 --source-build-id <producer-build-uuid>
+python buildkite\windows\ci.py test --architecture arm64 --test-suite deepgemm `
+    --source-build-id <producer-build-uuid>
 ```
 
 The CLI value takes precedence over the environment variable. No separate API
@@ -215,9 +258,9 @@ The runner reads metadata from the selected source build and downloads only
 the recorded producer job's files. Manifest/wheel hashes, producer identity,
 source SHA and runtime compatibility checks still apply. Only the requirement
 for identical **ci-infra** commits is relaxed in this explicit mode, allowing
-new diagnostics against an older wheel. `test-run.json` records the current
-test build ID and runner commit; `producer.json` and `build-manifest.json` keep
-the original build identity.
+new diagnostics against an older wheel. `test-run.json` records the selected
+suite, current test build ID and runner commit; `producer.json` and
+`build-manifest.json` keep the original build identity.
 
 Set the variable **when creating the new Buildkite build**: conditions are
 evaluated during pipeline upload. A build already queued at an older ci-infra
@@ -234,7 +277,7 @@ but do not install its Linux Torch/Numba pins blindly over the provisioned
 NVIDIA Torch. Supply compatible test dependencies in the pool's runtime
 manifest and wheelhouse. Tests may additionally need several GPUs, NCCL,
 Hugging Face access/credentials, large model storage, and external services.
-Some cannot run on Windows ARM64 at all. This pipeline deliberately attempts
+Some cannot run on Windows ARM64 at all. Full mode deliberately attempts
 the full tree and reports those incompatibilities; it does not claim that
 every test can execute successfully on one ARM64 machine. A root `conftest.py`
 import failure can prevent collection entirely and is a failure, not a skip.
@@ -247,11 +290,18 @@ still enforced. They are not copied into this repository's wheelhouse.
 The repository's [`wheelhouse`](wheelhouse/) contains local copies of
 `torchvision-0.29.0a0+10f68db-cp313-cp313-win_arm64.whl` and
 `flashinfer_python-0.6.17-py3-none-any.whl`, matching missing imports in build 16.
-This is not a complete test wheelhouse. These files are not automatically
-installed by the pytest harness; provide the relevant runtime requirements and
-wheelhouse path when provisioning. Compatible wheel tags do not guarantee
-TorchVision's ABI compatibility with the selected NVIDIA Torch or FlashInfer's
-Windows/backend support and dependency availability.
+This is not a complete test wheelhouse. ARM64 test jobs explicitly install this
+TorchVision wheel alongside vLLM into the disposable test venv, regardless of
+`VLLM_WINDOWS_WHEELHOUSE`. Installation uses `--no-deps` to preserve the pool's
+NVIDIA Torch and `--ignore-installed` to ensure a local copy even if TorchVision
+is already present in the pool. NumPy, Torch, and Pillow are inherited from the
+provisioned pool. A missing bundled wheel fails setup; there is no index fallback.
+The ARM64 wheel is not installed in x64 test jobs.
+
+FlashInfer is not automatically installed; provide its runtime requirements and
+wheelhouse path when provisioning if needed. Compatible wheel tags do not
+guarantee TorchVision's ABI compatibility with the selected NVIDIA Torch or
+FlashInfer's Windows/backend support and dependency availability.
 
 Newly provisioned agents carry `VLLM_WINDOWS_WHEELHOUSE` and
 `VLLM_WINDOWS_NO_INDEX` from the provisioning arguments. Full-test harness

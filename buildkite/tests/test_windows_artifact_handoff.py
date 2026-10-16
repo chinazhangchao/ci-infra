@@ -179,8 +179,9 @@ def test_build_only_never_installs_or_runs_tests(tmp_path, monkeypatch, gpu_avai
     ],
 )
 @pytest.mark.parametrize("source_mode", ["same-build", "argument", "environment"])
+@pytest.mark.parametrize("test_suite", ["full", "deepgemm"])
 def test_test_job_downloads_exact_producer_and_never_compiles(
-    tmp_path, monkeypatch, built_artifacts, failure, source_mode
+    tmp_path, monkeypatch, built_artifacts, failure, source_mode, test_suite
 ):
     directory, wheel, build_env, runtime, reference = built_artifacts
     cross_build = source_mode != "same-build"
@@ -242,8 +243,11 @@ def test_test_job_downloads_exact_producer_and_never_compiles(
         assert "nvcc.exe" not in " ".join(args)
         assert "build-win-arm64.ps1" not in " ".join(args)
 
-    def full_tests(python, venv, source, downloaded, work, output, test_env, target):
+    def full_tests(
+        python, venv, source, downloaded, work, output, test_env, target, suite
+    ):
         assert target == "arm64"
+        assert suite == test_suite
         full_calls.append(source)
         assert downloaded != wheel
         assert ci.sha256_file(downloaded) == ci.sha256_file(wheel)
@@ -256,9 +260,9 @@ def test_test_job_downloads_exact_producer_and_never_compiles(
     source_argument = SOURCE_BUILD_ID if source_mode == "argument" else None
     if failure:
         with pytest.raises((ValueError, subprocess.CalledProcessError)):
-            ci.test_build("arm64", source_argument)
+            ci.test_build("arm64", source_argument, test_suite)
     else:
-        ci.test_build("arm64", source_argument)
+        ci.test_build("arm64", source_argument, test_suite)
         assert len(full_calls) == 1
         assert not full_calls[0].exists()
         fetch = next(args for args in calls if "fetch" in args)
@@ -275,13 +279,14 @@ def test_test_job_downloads_exact_producer_and_never_compiles(
             "build_id": env["BUILDKITE_BUILD_ID"],
             "ci_infra_commit": env["BUILDKITE_COMMIT"],
             "source_build_id": SOURCE_BUILD_ID if cross_build else "build-1",
+            "suite": test_suite,
         }
         # A retry can land on another agent with no previous checkout or wheel.
         checkout = tmp_path / "retry-agent-checkout"
         checkout.mkdir()
         monkeypatch.chdir(checkout)
         prepared[2]["VLLM_WINDOWS_WORK_ROOT"] = str(checkout / "work")
-        ci.test_build("arm64", source_argument)
+        ci.test_build("arm64", source_argument, test_suite)
         assert len(full_calls) == 2
         assert full_calls[0] != full_calls[1]
         assert not full_calls[1].exists()
@@ -309,10 +314,17 @@ def test_test_job_downloads_exact_producer_and_never_compiles(
             ["build", "--architecture", "arm64", "--test-suite", "none"],
             ("arm64", "none"),
         ),
-        (["test", "--architecture", "arm64"], ("arm64", None)),
+        (["test", "--architecture", "arm64"], ("arm64", None, "full")),
         (
             ["test", "--architecture", "arm64", "--source-build-id", SOURCE_BUILD_ID],
-            ("arm64", SOURCE_BUILD_ID),
+            ("arm64", SOURCE_BUILD_ID, "full"),
+        ),
+        (
+            [
+                "test", "--architecture", "arm64", "--test-suite", "deepgemm",
+                "--source-build-id", SOURCE_BUILD_ID,
+            ],
+            ("arm64", SOURCE_BUILD_ID, "deepgemm"),
         ),
         (["build", "--architecture", "x64"], ("x64", "smoke")),
     ],
@@ -326,6 +338,14 @@ def test_cli_dispatches_independent_jobs(monkeypatch, arguments, expected):
     ci.main()
     (test if arguments[0] == "test" else build).assert_called_once_with(*expected)
     (build if arguments[0] == "test" else test).assert_not_called()
+
+
+def test_invalid_test_suite_does_not_request_artifacts(monkeypatch):
+    runner = Mock()
+    monkeypatch.setattr(ci, "run", runner)
+    with pytest.raises(ValueError, match="Unsupported pytest suite"):
+        ci.test_build("arm64", test_suite="unknown")
+    runner.assert_not_called()
 
 
 @pytest.mark.parametrize(

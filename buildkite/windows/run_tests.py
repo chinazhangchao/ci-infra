@@ -1,4 +1,4 @@
-"""Run the fork's entire pytest tree against the installed Windows wheel."""
+"""Run a selected fork pytest suite against the installed Windows wheel."""
 
 import argparse
 import importlib
@@ -15,18 +15,29 @@ FATAL_CUDA_ERRORS = (
     "CUDA error: out of memory",
     "CUDA_ERROR_OUT_OF_MEMORY",
     "CUDA error: an illegal memory access",
+    "CUDA error: unspecified launch failure",
+    "CUDA_ERROR_LAUNCH_FAILED",
     "device-side assert triggered",
     "Sticky error detected",
 )
 CHECKPOINT_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.4, 0.8, 1.0, 1.0, 1.0)
+TEST_TARGETS = {
+    "full": Path("tests"),
+    "deepgemm": (
+        Path("tests") / "kernels" / "moe" / "test_silu_mul_fp8_quant_deep_gemm.py"
+    ),
+}
 
 
 class TestResults:
-    def __init__(self, output, source):
+    def __init__(self, output, source, test_suite="full"):
+        if test_suite not in TEST_TARGETS:
+            raise ValueError(f"Unsupported pytest suite: {test_suite!r}")
         self.output = output
         self.terminal = None
         self.summary = {
-            "suite": "full",
+            "suite": test_suite,
+            "selected_paths": [str(TEST_TARGETS[test_suite])],
             "status": "initializing",
             "source": str(source),
             "exit_code": None,
@@ -162,13 +173,24 @@ def execute_tests(source, output, results):
             f"The selected vLLM commit has no tests directory: {tests}"
         )
 
+    test_suite = results.summary["suite"]
+    target = source / TEST_TARGETS[test_suite]
+    if test_suite == "deepgemm":
+        if not target.is_file():
+            raise FileNotFoundError(
+                f"The selected vLLM commit has no DeepGEMM test module: {target}"
+            )
+        # Surface the failing kernel at its launch, not at a later synchronization.
+        os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+    results.update(cuda_launch_blocking=os.environ.get("CUDA_LAUNCH_BLOCKING"))
+
     vllm = importlib.import_module("vllm")
     package = Path(vllm.__file__).resolve()
     if not package.is_relative_to(Path(sys.prefix).resolve()) or package.is_relative_to(
         source
     ):
         raise RuntimeError(
-            "Full tests must import vLLM from the job's installed wheel."
+            "Tests must import vLLM from the job's installed wheel."
         )
 
     # Keep installed packages ahead of the checkout, including in spawned Python
@@ -182,7 +204,7 @@ def execute_tests(source, output, results):
     sys.path[:0] = [str(site_packages), str(source)]
     pytest = importlib.import_module("pytest")
     args = [
-        str(tests),
+        str(target),
         "--optional",
         "--continue-on-collection-errors",
         "--maxfail=0",
@@ -191,18 +213,20 @@ def execute_tests(source, output, results):
         "addopts=",
         "-o",
         "pythonpath=",
-        "--tb=short",
+        "--tb=long" if test_suite == "deepgemm" else "--tb=short",
         "-ra",
         f"--junitxml={output / 'pytest.xml'}",
     ]
+    if test_suite == "deepgemm":
+        args.append("-vv")
     results.update(vllm_package=str(package), arguments=args)
     return int(pytest.main(args, plugins=[results]))
 
 
-def run_tests(source, output):
+def run_tests(source, output, test_suite="full"):
     source = source.resolve()
     output = output.resolve()
-    results = TestResults(output, source)
+    results = TestResults(output, source, test_suite)
     exit_code = None
     try:
         exit_code = execute_tests(source, output, results)
@@ -230,8 +254,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--test-suite", choices=TEST_TARGETS, default="full")
     args = parser.parse_args()
-    return run_tests(args.source_dir, args.output)
+    return run_tests(args.source_dir, args.output, args.test_suite)
 
 
 if __name__ == "__main__":

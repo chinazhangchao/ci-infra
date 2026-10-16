@@ -110,12 +110,14 @@ def test_pipeline_routes_selected_native_architectures(
         assert approval["key"] == "windows-arm64-test-approval"
         assert approval["depends_on"] == "windows-cuda-arm64"
         assert "block" in approval
+        assert "DeepGEMM" in approval["block"]
         assert "agents" not in approval
         assert test["depends_on"] == ["windows-cuda-arm64", approval["key"]]
         assert (
             test["command"]
-            == r"python buildkite\windows\ci.py test --architecture arm64"
+            == r"python buildkite\windows\ci.py test --architecture arm64 --test-suite deepgemm"
         )
+        assert test["label"] == ":windows: DeepGEMM pytest suite (arm64)"
         assert test["agents"] == builds[0]["agents"]
         assert test["timeout_in_minutes"] == 1440
         assert test["artifact_paths"] == ["artifacts/windows-arm64-tests/**/*"]

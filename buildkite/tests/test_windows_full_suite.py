@@ -216,12 +216,17 @@ def test_compiler_rejects_invalid_version_arguments(tmp_path, variable, value):
         ci.test_compiler_environment("arm64", env)
 
 
-@pytest.mark.parametrize("no_index", [False, True])
+@pytest.mark.parametrize(
+    "use_wheelhouse,no_index", [(False, False), (True, False), (True, True)]
+)
+@pytest.mark.parametrize("architecture", ["x64", "arm64"])
+@pytest.mark.parametrize("test_suite", ["full", "deepgemm"])
 @pytest.mark.parametrize(
     "failed_phase", [None, "compiler", "harness", "wheel", "pytest"]
 )
 def test_full_suite_setup_preserves_pool_and_failure(
-    tmp_path, monkeypatch, no_index, failed_phase
+    tmp_path, monkeypatch, use_wheelhouse, no_index, architecture, failed_phase,
+    test_suite,
 ):
     pool = tmp_path / "pool"
     source = tmp_path / "source"
@@ -232,9 +237,10 @@ def test_full_suite_setup_preserves_pool_and_failure(
         "PATH": "original",
         "PYTHONPATH": "unrelated-source",
         "PYTEST_ADDOPTS": "-x -k filtered",
-        "VLLM_WINDOWS_WHEELHOUSE": str(tmp_path / "wheelhouse with spaces"),
         "VLLM_WINDOWS_NO_INDEX": "1" if no_index else "0",
     }
+    if use_wheelhouse:
+        original["VLLM_WINDOWS_WHEELHOUSE"] = str(tmp_path / "wheelhouse with spaces")
     calls = []
     compiler_env = {
         **original,
@@ -245,8 +251,8 @@ def test_full_suite_setup_preserves_pool_and_failure(
         "LIB": "msvc-lib",
     }
 
-    def compiler_environment(architecture, env):
-        assert architecture == "arm64"
+    def compiler_environment(target, env):
+        assert target == architecture
         assert env is original
         if failed_phase == "compiler":
             raise RuntimeError("Compiler setup failed")
@@ -282,13 +288,17 @@ def test_full_suite_setup_preserves_pool_and_failure(
         tmp_path,
         output,
         original,
-        "arm64",
+        architecture,
+        test_suite,
     )
     if failed_phase == "compiler":
         with pytest.raises(RuntimeError, match="Compiler setup failed"):
             ci.run_full_tests(*args)
         assert not calls
         assert not (tmp_path / "test-venv").exists()
+        assert json.loads((output / "pytest-summary.json").read_text())["suite"] == (
+            test_suite
+        )
         return
     if failed_phase:
         with pytest.raises(subprocess.CalledProcessError) as error:
@@ -304,11 +314,12 @@ def test_full_suite_setup_preserves_pool_and_failure(
     assert inherited.read_text().strip() == str(pool / "Lib" / "site-packages")
     harness = calls[1][0]
     assert "--only-binary=:all:" in harness
-    assert "--find-links" in harness
-    assert (
-        harness[harness.index("--find-links") + 1]
-        == original["VLLM_WINDOWS_WHEELHOUSE"]
-    )
+    assert ("--find-links" in harness) == use_wheelhouse
+    if use_wheelhouse:
+        assert (
+            harness[harness.index("--find-links") + 1]
+            == original["VLLM_WINDOWS_WHEELHOUSE"]
+        )
     assert ("--no-index" in harness) == no_index
     for command, kwargs in calls[1:]:
         assert command[0] == str(tmp_path / "test-venv" / "Scripts" / "python.exe")
@@ -327,8 +338,17 @@ def test_full_suite_setup_preserves_pool_and_failure(
         assert "--no-deps" in calls[2][0]
         assert "--only-binary=:all:" in calls[2][0]
         assert "--no-compile" in calls[2][0]
+        assert "--ignore-installed" in calls[2][0]
         assert str(wheel) in calls[2][0]
+        torchvision = (
+            ci.HERE
+            / "wheelhouse"
+            / "torchvision-0.29.0a0+10f68db-cp313-cp313-win_arm64.whl"
+        )
+        assert (str(torchvision) in calls[2][0]) == (architecture == "arm64")
+        assert not any("flashinfer" in arg for arg in calls[2][0])
         assert calls[-1][0][1:3] == ["-I", str(ci.HERE / "run_tests.py")]
+        assert calls[-1][0][-2:] == ["--test-suite", test_suite]
         assert calls[-1][1]["cwd"] == source
         assert (inherited.parent / "_vllm_ci_wheel_imports.py").read_text() == (
             ci.HERE / "wheel_imports.py"
@@ -339,6 +359,29 @@ def test_full_suite_setup_preserves_pool_and_failure(
         assert (inherited.parent / "_vllm_ci_windows_helpers.py").read_text() == (
             ci.HERE / "windows_helpers.py"
         ).read_text()
+
+
+def test_missing_bundled_torchvision_fails_before_environment_setup(tmp_path, monkeypatch):
+    monkeypatch.setattr(ci, "HERE", tmp_path / "ci")
+    compiler = Mock()
+    runner = Mock()
+    monkeypatch.setattr(ci, "test_compiler_environment", compiler)
+    monkeypatch.setattr(ci, "run", runner)
+    with pytest.raises(
+        FileNotFoundError, match="Bundled ARM64 TorchVision wheel is missing"
+    ):
+        ci.run_full_tests(
+            tmp_path / "python.exe",
+            tmp_path / "pool",
+            tmp_path / "source",
+            tmp_path / "vllm.whl",
+            tmp_path,
+            tmp_path,
+            {},
+            "arm64",
+        )
+    compiler.assert_not_called()
+    runner.assert_not_called()
 
 
 def test_full_runner_rejects_cached_or_source_package(tmp_path, monkeypatch):
@@ -493,6 +536,7 @@ def test_full_runner_really_runs_optional_tests_without_filters(
     tmp_path, collection_failure, test_failure
 ):
     python, source, tests, output, env = prepare_full_runner(tmp_path)
+    env["CUDA_LAUNCH_BLOCKING"] = "0"
     (tests / "test_all.py").write_text(
         "import os, subprocess, sys, pytest, vllm\n"
         "from tests.helper import VALUE\n"
@@ -548,6 +592,10 @@ def test_full_runner_really_runs_optional_tests_without_filters(
         result.stdout + result.stderr
     )
     summary = json.loads((output / "pytest-summary.json").read_text())
+    assert summary["suite"] == "full"
+    assert summary["selected_paths"] == ["tests"]
+    assert summary["cuda_launch_blocking"] == "0"
+    assert "--tb=short" in summary["arguments"]
     assert summary["collected"] == 3 + 2 * int(test_failure)
     assert summary["passed"] == 3 + int(test_failure)
     assert summary["failed"] == int(test_failure)
@@ -597,10 +645,103 @@ def test_child_import_hook_rejects_missing_wheel_instead_of_source(tmp_path):
 
 
 @pytest.mark.parametrize(
+    "module_state", ["present", "missing", "collection-error", "cuda-failure"]
+)
+def test_deepgemm_runner_only_collects_selected_module(tmp_path, module_state):
+    python, source, tests, output, env = prepare_full_runner(tmp_path)
+    env["CUDA_LAUNCH_BLOCKING"] = "0"
+    for directory in ("distributed", "basic_correctness", "entrypoints"):
+        excluded = tests / directory
+        excluded.mkdir()
+        (excluded / "conftest.py").write_text(
+            "raise RuntimeError('Must not import excluded suite conftest')\n"
+        )
+        (excluded / "test_excluded.py").write_text(
+            "raise RuntimeError('Must not collect memory-budget or distributed tests')\n"
+        )
+    target = source / run_tests.TEST_TARGETS["deepgemm"]
+    if module_state != "missing":
+        target.parent.mkdir(parents=True)
+        target.write_text(
+            "import os, pytest, vllm\n"
+            "assert os.environ['CUDA_LAUNCH_BLOCKING'] == '1'\n"
+            "assert vllm.ORIGIN == 'built-wheel'\n"
+            + (
+                "raise ImportError('DeepGEMM dependency is missing')\n"
+                if module_state == "collection-error"
+                else "@pytest.mark.parametrize('case', [0, 1])\n"
+                "@pytest.mark.optional\n"
+                "def test_deepgemm(case):\n"
+                + (
+                    "    raise RuntimeError('CUDA error: unspecified launch failure')\n"
+                    if module_state == "cuda-failure"
+                    else "    assert case in (0, 1)\n"
+                )
+            )
+        )
+    original = target.read_bytes() if target.is_file() else None
+    result = subprocess.run(
+        [
+            str(python),
+            "-I",
+            str(Path(run_tests.__file__)),
+            "--source-dir",
+            str(source),
+            "--output",
+            str(output),
+            "--test-suite",
+            "deepgemm",
+        ],
+        cwd=source,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    summary = json.loads((output / "pytest-summary.json").read_text())
+    assert summary["suite"] == "deepgemm"
+    assert summary["selected_paths"] == [str(run_tests.TEST_TARGETS["deepgemm"])]
+    assert "Must not" not in result.stdout + result.stderr
+    assert summary["skipped"] == summary["deselected"] == 0
+    if module_state == "missing":
+        assert result.returncode != 0
+        assert summary["status"] == "error"
+        assert "no DeepGEMM test module" in result.stderr
+        assert not target.exists()
+        return
+    assert target.read_bytes() == original
+    assert summary["cuda_launch_blocking"] == "1"
+    assert summary["arguments"][0] == str(target)
+    assert "--tb=long" in summary["arguments"]
+    assert "-vv" in summary["arguments"]
+    assert (output / "pytest.xml").is_file()
+    if module_state == "cuda-failure":
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert summary["status"] == "aborted"
+        assert summary["collected"] == 2
+        assert summary["completed"] == summary["failed"] == 1
+        assert summary["passed"] == 0
+        assert "test_deepgemm[0]" in summary["stop_reason"]
+        assert summary["collection_errors"] == 0
+    elif module_state == "collection-error":
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert summary["status"] == "failed"
+        assert summary["collection_errors"] == 1
+        assert summary["collected"] == 0
+    else:
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert summary["status"] == "passed"
+        assert summary["collected"] == summary["completed"] == summary["passed"] == 2
+        assert summary["collection_errors"] == 0
+
+
+@pytest.mark.parametrize(
     "message",
     [
         "CUDA error: out of memory",
         "CUDA error: an illegal memory access was encountered",
+        "CUDA error: unspecified launch failure",
+        "CUDA_ERROR_LAUNCH_FAILED",
         "CUDA error: device-side assert triggered",
         "CUDA_ERROR_OUT_OF_MEMORY",
         "Sticky error detected",

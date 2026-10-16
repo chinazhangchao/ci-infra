@@ -392,7 +392,9 @@ def verify_build_artifacts(
     return wheel, manifest
 
 
-def test_build(architecture, source_build_id=None):
+def test_build(architecture, source_build_id=None, test_suite="full"):
+    if test_suite not in ("full", "deepgemm"):
+        raise ValueError(f"Unsupported pytest suite: {test_suite!r}")
     if sys.platform != "win32":
         raise RuntimeError("Windows CUDA tests must run on Windows agents.")
     python, venv, env = build_environment(architecture, os.environ)
@@ -448,6 +450,7 @@ def test_build(architecture, source_build_id=None):
                 "build_id": required(env, "BUILDKITE_BUILD_ID"),
                 "ci_infra_commit": required(env, "BUILDKITE_COMMIT"),
                 "source_build_id": requested_build,
+                "suite": test_suite,
             },
             indent=2,
         )
@@ -497,7 +500,9 @@ def test_build(architecture, source_build_id=None):
         )
         source = work / "src"
         checkout_source(source, manifest["source"], env)
-        run_full_tests(python, venv, source, wheel, work, output, env, architecture)
+        run_full_tests(
+            python, venv, source, wheel, work, output, env, architecture, test_suite
+        )
 
 
 def test_compiler_environment(architecture, env):
@@ -571,14 +576,28 @@ def test_compiler_environment(architecture, env):
         )
     prepared["CC"] = compiler
     prepared["CXX"] = compiler
-    print(f"Full-suite JIT compiler: {compiler}", flush=True)
+    print(f"Pytest JIT compiler: {compiler}", flush=True)
     return prepared
 
 
-def run_full_tests(python, venv, source, wheel, work, output, env, architecture):
+def run_full_tests(
+    python, venv, source, wheel, work, output, env, architecture, test_suite="full"
+):
     summary_path = output / "pytest-summary.json"
-    summary = {"suite": "full", "status": "preparing-test-environment"}
+    summary = {"suite": test_suite, "status": "preparing-test-environment"}
     summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    test_wheels = [wheel]
+    if architecture == "arm64":
+        torchvision = (
+            HERE
+            / "wheelhouse"
+            / "torchvision-0.29.0a0+10f68db-cp313-cp313-win_arm64.whl"
+        )
+        if not torchvision.is_file():
+            raise FileNotFoundError(
+                f"Bundled ARM64 TorchVision wheel is missing: {torchvision}"
+            )
+        test_wheels.append(torchvision)
     compiler_env = test_compiler_environment(architecture, env)
     test_venv = Path(work) / "test-venv"
     run([python, "-I", "-m", "venv", test_venv], cwd=work, env=env)
@@ -620,7 +639,7 @@ def run_full_tests(python, venv, source, wheel, work, output, env, architecture)
             "--no-deps",
             "--no-compile",
             "--ignore-installed",
-            wheel,
+            *test_wheels,
         ],
         cwd=work,
         env=test_env,
@@ -642,6 +661,8 @@ def run_full_tests(python, venv, source, wheel, work, output, env, architecture)
             source,
             "--output",
             output,
+            "--test-suite",
+            test_suite,
         ],
         cwd=source,
         env=test_env,
@@ -739,6 +760,12 @@ def main():
     test_parser = subcommands.add_parser("test")
     test_parser.add_argument("--architecture", choices=PLATFORMS, required=True)
     test_parser.add_argument(
+        "--test-suite",
+        choices=["full", "deepgemm"],
+        default="full",
+        help="Select the full tree or only the DeepGEMM SiLU/FP8 reference-scale tests.",
+    )
+    test_parser.add_argument(
         "--source-build-id",
         help=f"Reuse a previous Buildkite build's artifacts (also via {TEST_BUILD_ID_ENV}).",
     )
@@ -746,7 +773,7 @@ def main():
     if args.command == "resolve":
         resolve_source()
     elif args.command == "test":
-        test_build(args.architecture, args.source_build_id)
+        test_build(args.architecture, args.source_build_id, args.test_suite)
     else:
         build(args.architecture, args.test_suite)
 
