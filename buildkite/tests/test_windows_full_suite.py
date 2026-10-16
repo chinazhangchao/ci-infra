@@ -280,7 +280,7 @@ def test_compiler_rejects_invalid_version_arguments(tmp_path, variable, value):
     "use_wheelhouse,no_index", [(False, False), (True, False), (True, True)]
 )
 @pytest.mark.parametrize("architecture", ["x64", "arm64"])
-@pytest.mark.parametrize("test_suite", ["full", "deepgemm"])
+@pytest.mark.parametrize("test_suite", ["core", "full", "deepgemm"])
 @pytest.mark.parametrize(
     "failed_phase",
     [
@@ -959,6 +959,145 @@ def test_child_import_hook_rejects_missing_wheel_instead_of_source(tmp_path):
     assert "Imported source instead of wheel" not in result.stderr
 
 
+def test_core_selection_is_bounded_and_single_gpu():
+    from collections import Counter
+
+    targets = run_tests.TEST_TARGETS["core"]
+    assert len(targets) == len(set(targets)) == 120
+    functions = Counter(
+        target.partition("::")[2].partition("[")[0] for target in targets
+    )
+    assert functions == {
+        "": 3,
+        "test_act_and_mul": 24,
+        "test_rms_norm": 48,
+        "test_gemma_rms_norm_mixed_input_weight_dtype": 1,
+        "test_fused_rms_norm_quant": 4,
+        "test_rotary_embedding": 32,
+        "test_reshape_and_cache": 8,
+    }
+    assert all("cuda:1" not in target for target in targets)
+    assert all("deep_gemm" not in target for target in targets)
+    assert all("distributed" not in target for target in targets)
+    for target in targets:
+        filename, separator, _ = target.partition("::")
+        assert separator or Path(filename).parent == Path("tests") / "utils_"
+
+
+@pytest.mark.parametrize(
+    "state", ["present", "missing-file", "missing-node", "test-failure"]
+)
+def test_core_runner_executes_only_the_curated_cases(tmp_path, state):
+    python, source, tests, output, env = prepare_full_runner(tmp_path)
+    env["CUDA_LAUNCH_BLOCKING"] = "0"
+    utilities = tests / "utils_"
+    utilities.mkdir()
+    (utilities / "__init__.py").touch()
+    targets = run_tests.TEST_TARGETS["core"]
+    modules = {}
+    for target in targets:
+        filename, _, node = target.partition("::")
+        functions = modules.setdefault(filename, {})
+        if node:
+            name, bracket, parameter = node.partition("[")
+            functions.setdefault(name, []).append(parameter[:-1] if bracket else None)
+    missing = next(target for target in targets if "::test_act_and_mul[" in target)
+    missing_file, _, missing_node = missing.partition("::")
+    missing_case = missing_node.partition("[")[2][:-1]
+    utility_counts = {
+        "test_import_utils.py": 6,
+        "test_collection_utils.py": 10,
+        "test_cache.py": 2,
+    }
+    for filename, functions in modules.items():
+        path = source / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        content = (
+            "import os, pytest, vllm\n"
+            "assert vllm.ORIGIN == 'built-wheel'\n"
+            "assert os.environ['CUDA_LAUNCH_BLOCKING'] == '0'\n"
+        )
+        if not functions:
+            content += (
+                f"@pytest.mark.parametrize('case', range({utility_counts[path.name]}))\n"
+                "def test_utility(case):\n    assert case >= 0\n"
+            )
+        else:
+            for name, parameters in functions.items():
+                if parameters == [None]:
+                    content += f"def {name}():\n    pass\n"
+                    continue
+                if state == "missing-node" and filename == missing_file:
+                    parameters = [case for case in parameters if case != missing_case]
+                parameters = [*parameters, "unselected"]
+                content += (
+                    f"@pytest.mark.parametrize('case', {parameters!r}, ids={parameters!r})\n"
+                    f"def {name}(case):\n"
+                    "    assert case != 'unselected', 'Unselected parameter ran'\n"
+                )
+                if state == "test-failure" and filename == missing_file:
+                    content += f"    assert case != {missing_case!r}, 'core failure'\n"
+            content += (
+                "def test_unselected():\n"
+                "    raise AssertionError('Unselected function ran')\n"
+            )
+        path.write_text(content)
+    if state == "missing-file":
+        (source / missing_file).unlink()
+    for relative in (
+        Path("distributed") / "test_excluded.py",
+        Path("basic_correctness") / "test_mem.py",
+        Path("kernels") / "moe" / "test_silu_mul_fp8_quant_deep_gemm.py",
+        Path("kernels") / "core" / "test_fused_quant_layernorm.py",
+    ):
+        excluded = tests / relative
+        excluded.parent.mkdir(parents=True, exist_ok=True)
+        excluded.write_text("raise RuntimeError('Must not collect this test module')\n")
+    result = subprocess.run(
+        [
+            str(python),
+            "-I",
+            str(Path(run_tests.__file__)),
+            "--source-dir",
+            str(source),
+            "--output",
+            str(output),
+            "--test-suite",
+            "core",
+        ],
+        cwd=source,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    summary = json.loads((output / "pytest-summary.json").read_text())
+    assert summary["suite"] == "core"
+    assert summary["selected_paths"] == list(targets)
+    assert "Must not collect" not in result.stdout + result.stderr
+    if state == "missing-file":
+        assert result.returncode != 0
+        assert summary["status"] == "error"
+        assert "no core test target" in result.stderr
+        return
+    assert summary["cuda_launch_blocking"] == "0"
+    assert "-vv" in summary["arguments"]
+    if state == "missing-node":
+        assert result.returncode == 4, result.stdout + result.stderr
+        assert summary["status"] == "failed"
+        assert "not found" in result.stderr
+        return
+    failed = int(state == "test-failure")
+    assert result.returncode == failed, result.stdout + result.stderr
+    assert summary["collected"] == summary["completed"] == 135
+    assert summary["failed"] == failed
+    assert summary["passed"] == 135 - failed
+    assert (
+        summary["collection_errors"] == summary["skipped"] == summary["deselected"] == 0
+    )
+    assert (output / "pytest.xml").is_file()
+
+
 @pytest.mark.parametrize(
     "module_state", ["present", "missing", "collection-error", "cuda-failure"]
 )
@@ -974,7 +1113,7 @@ def test_deepgemm_runner_only_collects_selected_module(tmp_path, module_state):
         (excluded / "test_excluded.py").write_text(
             "raise RuntimeError('Must not collect memory-budget or distributed tests')\n"
         )
-    target = source / run_tests.TEST_TARGETS["deepgemm"]
+    target = source / run_tests.TEST_TARGETS["deepgemm"][0]
     if module_state != "missing":
         target.parent.mkdir(parents=True)
         target.write_text(
@@ -1015,13 +1154,13 @@ def test_deepgemm_runner_only_collects_selected_module(tmp_path, module_state):
     )
     summary = json.loads((output / "pytest-summary.json").read_text())
     assert summary["suite"] == "deepgemm"
-    assert summary["selected_paths"] == [str(run_tests.TEST_TARGETS["deepgemm"])]
+    assert summary["selected_paths"] == list(run_tests.TEST_TARGETS["deepgemm"])
     assert "Must not" not in result.stdout + result.stderr
     assert summary["skipped"] == summary["deselected"] == 0
     if module_state == "missing":
         assert result.returncode != 0
         assert summary["status"] == "error"
-        assert "no DeepGEMM test module" in result.stderr
+        assert "no deepgemm test target" in result.stderr
         assert not target.exists()
         return
     assert target.read_bytes() == original

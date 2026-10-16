@@ -9,8 +9,9 @@ Existing Linux pipelines and the Linux-oriented pipeline generator are unchanged
 For **ARM64 only**, upload
 [windows-arm64.yml](../../.buildkite/pipelines/windows-arm64.yml) instead.
 It builds the wheel, pauses for **manual approval**, then runs a separate job
-running **only the DeepGEMM SiLU/FP8 reference-scale test module**.
-Model-memory-budget, model/server, and distributed test suites are not collected.
+running a **curated core functional suite**, not the full upstream test tree.
+Model-memory-budget, model/server, distributed, and DeepGEMM diagnostic suites
+are not collected by default.
 Tests can be retried without recompiling. This preserves the combined pipeline's
 smoke-test and x64 settings and requires only an ARM64 queue.
 
@@ -41,14 +42,60 @@ in `smoke.json`, and runs `_C.silu_and_mul` for either layout.
 2. **Build CUDA wheel:** `ci.py build --architecture arm64 --test-suite none`
    compiles and validates the wheel, then uploads the wheel, SHA-256 sidecar,
    source/runtime metadata and `build-manifest.json`. It runs no tests.
-3. **Run DeepGEMM ARM64 tests:** a manual approval block after the build
+3. **Run core ARM64 tests:** a manual approval block after the build
    succeeds. The pipeline can remain here until you are ready to test.
-4. **DeepGEMM pytest suite:** `ci.py test --architecture arm64 --test-suite deepgemm`
+4. **Core functional pytest suite:** `ci.py test --architecture arm64 --test-suite core`
    downloads artifacts from the recorded producer job ID in the **same Buildkite build**, verifies
    both manifest and wheel checksums, and checks out tests from the wheel's
    exact source SHA. It never invokes the vLLM build helper.
 
-The `deepgemm` selection runs every parametrization in
+#### Default core suite
+
+The `core` selection contains **135 cases at fork revision
+`bd3dc3d3364a50012bf70b7376010c1b2c89633c`**, selected in
+[`run_tests.py`](run_tests.py). It runs the original upstream tests and assertions,
+not replacement smoke-test implementations.
+
+| Coverage | Cases | Selected scope |
+|---|---:|---|
+| Import utilities | 6 | Placeholder errors, import availability and caching |
+| Collection utilities | 10 | Common prefixes and dictionary updates |
+| LRU cache | 2 | Eviction, accounting and capacity handling |
+| CUDA activations | 24 | SiLU/multiply and GELU variants; FP16/BF16/FP32; 7/83 tokens, width 512 |
+| RMSNorm | 48 | FP16/BF16/FP32, residual/no residual, contiguous/strided input; widths 768/769 |
+| Gemma RMSNorm | 1 | Mixed input/weight dtypes |
+| Fused RMSNorm/FP8 | 4 | FP16/BF16 input, residual/no residual; 7 tokens, width 768 |
+| Rotary embeddings | 32 | BF16/FP32, NeoX/GPT-J layout, full/partial rotation, key/no key, contiguous/strided input |
+| KV-cache kernels | 8 | Auto/FP8 cache storage, BF16/FP32 input, head sizes 64/80; 1024 blocks of 16 slots |
+
+All selected CUDA cases use `cuda:0`. The suite does not start model servers,
+download model weights, initialize a distributed process group, reserve an
+engine GPU-memory budget, or run the known-failing DeepGEMM reference-scale
+case. CUDA allocation is limited to the selected kernel tensor shapes, not a
+fraction of total GPU memory. The existing NVIDIA TorchVision import/native-NMS
+preflight still runs before pytest.
+
+Only the three lightweight utility modules are collected in full. CUDA cases
+use explicit parameter IDs so adding larger shapes or more devices upstream
+does not expand this suite silently. Review the selectors when updating the
+fork revision. A missing file or parameter ID fails the job; there is no
+fallback to full-suite collection. Ancestor `conftest.py` fixtures still apply.
+Excluded tests are not reported as skipped or passed.
+
+`ci.py test --architecture arm64` defaults to `core`; the pipeline also passes
+the selection explicitly. The x64 test command retains `full` as its default.
+The lower-level `run_tests.py` keeps its existing `full` default and receives an
+explicit suite from `ci.py`.
+
+#### Opt-in diagnostics
+
+The `deepgemm` selection remains available explicitly:
+
+```powershell
+python buildkite\windows\ci.py test --architecture arm64 --test-suite deepgemm
+```
+
+It runs every parametrization in
 `tests\kernels\moe\test_silu_mul_fp8_quant_deep_gemm.py` in a fresh test process,
 without first collecting or executing other test modules. Ancestor
 `conftest.py` files still apply. Excluded suites are **not collected**, rather
@@ -71,9 +118,8 @@ explicitly with:
 python buildkite\windows\ci.py test --architecture arm64 --test-suite full
 ```
 
-The standalone CLI and `run_tests.py` retain `full` as their default for
-compatibility; the ARM64 pipeline explicitly selects `deepgemm`. Full mode
-does not force synchronous CUDA launches.
+Neither `core` nor `full` forces synchronous CUDA launches; `deepgemm` does.
+The standard ARM64 pipeline never selects either diagnostic suite automatically.
 
 Build and test jobs can run on different provisioned ARM64 agents; they do not
 share a filesystem. The test agent must match the recorded Python major/minor,
@@ -91,7 +137,7 @@ The test job creates a disposable test venv, makes the provisioned pool
 dependencies available through a `.pth` file, and installs the new wheel
 locally with its console scripts. ARM64 test jobs select and install TorchVision
 from the same NVIDIA nightly index used to provision Torch before resolving
-test dependencies, for both `deepgemm` and `full` suites. The pinned checkout's
+test dependencies, for all three suites. The pinned checkout's
 pure-Python `tests\vllm_test_utils` package
 is installed locally, matching the Linux test image.
 
@@ -148,7 +194,12 @@ package, using the existing build tools without dependency resolution or build
 isolation. The test job does not rebuild vLLM or compile native dependencies.
 Compiler, header or library discovery failures stop setup before pytest starts.
 
-The pipeline's effective pytest invocation is:
+The pipeline passes the explicit core selectors from `run_tests.py` to pytest
+with `--optional --continue-on-collection-errors --maxfail=0`,
+`--import-mode=append`, cleared inherited addopts/pythonpath, `--tb=short`,
+`-ra -vv`, and the JUnit output path. It does not invoke `pytest tests`.
+
+With `--test-suite deepgemm`, the effective pytest invocation is:
 
 ```powershell
 $env:CUDA_LAUNCH_BLOCKING = "1"
@@ -185,7 +236,7 @@ directory, alongside a copy of the verified build manifest, producer reference,
 and test runtime:
 
 - `pytest-summary.json` is checkpointed during collection and test execution.
-  It records the selected `suite`, `selected_paths`, effective
+  It records the selected `suite`, `selected_paths` (including parameter IDs), effective
   `cuda_launch_blocking` setting, collected/completed tests, passes, failed
   reports (including setup/teardown), skips, collection errors, the active test and the final
   pytest exit code. CUDA resource/context failures also record `stop_reason`
@@ -230,10 +281,10 @@ or insufficient GPU memory; those remain explicit failures, not automatic skips.
 Build and test have independent timeouts of 6 hours and 24 hours respectively;
 the combined pipeline's timeouts are unchanged.
 
-After a successful build, click **Run DeepGEMM ARM64 tests** in Buildkite to
+After a successful build, click **Run core ARM64 tests** in Buildkite to
 release the test job. Automatic Buildkite retries are disabled for the test
 job, including agent-loss failures; the build job's one-time infrastructure
-retry is unchanged. To retry failures manually, retry **DeepGEMM pytest suite (arm64)**
+retry is unchanged. To retry failures manually, retry **Core functional pytest suite (arm64)**
 only, not the build job or the entire build. It downloads the saved wheel
 again and uses a fresh test checkout/venv. Artifact retention must cover the
 delay before testing. Deliberately retrying the producer build replaces its
@@ -257,14 +308,14 @@ In Buildkite **New Build**, use the current ci-infra branch/commit so the test
 job receives the latest runner fixes, and put the variable above in the build's
 environment variables. Keep the pipeline's initial upload command unchanged.
 When `windows-arm64.yml` is uploaded, it skips source resolution, wheel
-compilation, and the approval block. **DeepGEMM pytest suite (arm64)** runs directly
-against the prior wheel, collecting only the selected module. Automatic
+compilation, and the approval block. **Core functional pytest suite (arm64)** runs directly
+against the prior wheel, collecting only the curated cases. Automatic
 test-job retries remain disabled.
 
 The test command can also select the source explicitly inside a Buildkite job:
 
 ```powershell
-python buildkite\windows\ci.py test --architecture arm64 --test-suite deepgemm `
+python buildkite\windows\ci.py test --architecture arm64 --test-suite core `
     --source-build-id <producer-build-uuid>
 ```
 
@@ -329,7 +380,7 @@ available on this agent:
 
 These exceptions are not automatic test skips or success fallbacks. Full mode
 still reports unavailable imports/backends as failures or honors the fork's
-own skip conditions. The pipeline's DeepGEMM-only selection remains unchanged.
+own skip conditions. These exceptions do not expand the pipeline's core selection.
 Model access credentials, device memory, multiple GPUs, native DLLs, and
 external services are separate prerequisites. A root `conftest.py` import
 failure remains a failure.

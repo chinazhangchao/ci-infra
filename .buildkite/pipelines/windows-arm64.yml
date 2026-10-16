@@ -1,6 +1,6 @@
 # ARM64-only entrypoint; windows.yml retains the combined x64/ARM64 pipeline.
 # Set VLLM_WINDOWS_TEST_BUILD_ID on a new build to test a previous build's wheel.
-# Only collect the DeepGEMM reference-scale test module for this diagnostic run.
+# Run curated single-GPU functional tests, not the full upstream suite.
 steps:
   - label: ":windows: Resolve vLLM source"
     key: windows-source
@@ -25,20 +25,20 @@ steps:
         - exit_status: -1
           limit: 1
 
-  - block: ":pytest: Run DeepGEMM ARM64 tests"
+  - block: ":pytest: Run core ARM64 tests"
     key: windows-arm64-test-approval
     if: 'build.env("VLLM_WINDOWS_TEST_BUILD_ID") == null || build.env("VLLM_WINDOWS_TEST_BUILD_ID") == ""'
     depends_on: windows-cuda-arm64
-    prompt: "The wheel is built. Run only the DeepGEMM SiLU/FP8 test module, without model-memory or distributed suites?"
+    prompt: "The wheel is built. Run the selected utility and single-GPU CUDA correctness tests, without model-memory or distributed suites?"
 
-  - label: ":windows: DeepGEMM pytest suite (arm64)"
+  - label: ":windows: Core functional pytest suite (arm64)"
     key: windows-tests-arm64
     depends_on:
       - windows-cuda-arm64
       - windows-arm64-test-approval
     agents:
       queue: "${WINDOWS_ARM64_QUEUE:-windows-arm64}"
-    command: 'python buildkite\windows\ci.py test --architecture arm64 --test-suite deepgemm'
+    command: 'python buildkite\windows\ci.py test --architecture arm64 --test-suite core'
     artifact_paths:
       - "artifacts/windows-arm64-tests/**/*"
     timeout_in_minutes: 1440

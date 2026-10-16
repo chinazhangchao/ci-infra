@@ -179,10 +179,11 @@ def test_build_only_never_installs_or_runs_tests(tmp_path, monkeypatch, gpu_avai
     ],
 )
 @pytest.mark.parametrize("source_mode", ["same-build", "argument", "environment"])
-@pytest.mark.parametrize("test_suite", ["full", "deepgemm"])
+@pytest.mark.parametrize("test_suite", [None, "core", "full", "deepgemm"])
 def test_test_job_downloads_exact_producer_and_never_compiles(
     tmp_path, monkeypatch, built_artifacts, failure, source_mode, test_suite
 ):
+    expected_suite = "core" if test_suite is None else test_suite
     directory, wheel, build_env, runtime, reference = built_artifacts
     cross_build = source_mode != "same-build"
     if cross_build:
@@ -247,7 +248,7 @@ def test_test_job_downloads_exact_producer_and_never_compiles(
         python, venv, source, downloaded, work, output, test_env, target, suite
     ):
         assert target == "arm64"
-        assert suite == test_suite
+        assert suite == expected_suite
         full_calls.append(source)
         assert downloaded != wheel
         assert ci.sha256_file(downloaded) == ci.sha256_file(wheel)
@@ -279,7 +280,7 @@ def test_test_job_downloads_exact_producer_and_never_compiles(
             "build_id": env["BUILDKITE_BUILD_ID"],
             "ci_infra_commit": env["BUILDKITE_COMMIT"],
             "source_build_id": SOURCE_BUILD_ID if cross_build else "build-1",
-            "suite": test_suite,
+            "suite": expected_suite,
         }
         # A retry can land on another agent with no previous checkout or wheel.
         checkout = tmp_path / "retry-agent-checkout"
@@ -314,15 +315,29 @@ def test_test_job_downloads_exact_producer_and_never_compiles(
             ["build", "--architecture", "arm64", "--test-suite", "none"],
             ("arm64", "none"),
         ),
-        (["test", "--architecture", "arm64"], ("arm64", None, "full")),
+        (["test", "--architecture", "arm64"], ("arm64", None, None)),
+        (["test", "--architecture", "x64"], ("x64", None, None)),
         (
             ["test", "--architecture", "arm64", "--source-build-id", SOURCE_BUILD_ID],
-            ("arm64", SOURCE_BUILD_ID, "full"),
+            ("arm64", SOURCE_BUILD_ID, None),
+        ),
+        (
+            ["test", "--architecture", "arm64", "--test-suite", "core"],
+            ("arm64", None, "core"),
+        ),
+        (
+            ["test", "--architecture", "arm64", "--test-suite", "full"],
+            ("arm64", None, "full"),
         ),
         (
             [
-                "test", "--architecture", "arm64", "--test-suite", "deepgemm",
-                "--source-build-id", SOURCE_BUILD_ID,
+                "test",
+                "--architecture",
+                "arm64",
+                "--test-suite",
+                "deepgemm",
+                "--source-build-id",
+                SOURCE_BUILD_ID,
             ],
             ("arm64", SOURCE_BUILD_ID, "deepgemm"),
         ),

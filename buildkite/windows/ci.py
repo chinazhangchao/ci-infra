@@ -394,8 +394,10 @@ def verify_build_artifacts(
     return wheel, manifest
 
 
-def test_build(architecture, source_build_id=None, test_suite="full"):
-    if test_suite not in ("full", "deepgemm"):
+def test_build(architecture, source_build_id=None, test_suite=None):
+    if test_suite is None:
+        test_suite = "core" if architecture == "arm64" else "full"
+    if test_suite not in ("core", "full", "deepgemm"):
         raise ValueError(f"Unsupported pytest suite: {test_suite!r}")
     if sys.platform != "win32":
         raise RuntimeError("Windows CUDA tests must run on Windows agents.")
@@ -931,9 +933,9 @@ def main():
     test_parser.add_argument("--architecture", choices=PLATFORMS, required=True)
     test_parser.add_argument(
         "--test-suite",
-        choices=["full", "deepgemm"],
-        default="full",
-        help="Select the full tree or only the DeepGEMM SiLU/FP8 reference-scale tests.",
+        choices=["core", "full", "deepgemm"],
+        help="Select curated core tests (default on ARM64), the full tree "
+        "(default on x64), or the DeepGEMM diagnostic module.",
     )
     test_parser.add_argument(
         "--source-build-id",

@@ -115,10 +115,11 @@ use the Linux pipeline generator or Docker.
 For ARM64-only builds, use
 [windows-arm64.yml](.buildkite/pipelines/windows-arm64.yml): it separates wheel
 compilation from tests with a manual approval step and a verified artifact
-handoff, allowing test retries without rebuilding. It currently runs only the
-DeepGEMM SiLU/FP8 reference-scale test module, excluding model-memory-budget and
-distributed suites from collection. Full-suite testing remains available with
-`ci.py test --test-suite full`. The combined pipeline's settings remain unchanged.
+handoff, allowing test retries without rebuilding. It defaults to a curated
+single-GPU functional suite covering core CUDA kernels and lightweight utilities,
+excluding model-memory-budget, model/server, distributed, and DeepGEMM diagnostic
+suites. Full-suite and DeepGEMM diagnostics require explicit selection. The
+combined pipeline's settings remain unchanged.
 
 See [Windows private-pool setup](buildkite/windows/README.md) for queue
 configuration, required toolchains/private ARM64 PyTorch dependencies, source

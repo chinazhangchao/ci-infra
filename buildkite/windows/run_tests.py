@@ -21,10 +21,70 @@ FATAL_CUDA_ERRORS = (
     "Sticky error detected",
 )
 CHECKPOINT_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.4, 0.8, 1.0, 1.0, 1.0)
+
+
+def _core_test_targets():
+    tests = Path("tests")
+    kernels = tests / "kernels" / "core"
+    targets = [
+        str(tests / "utils_" / name)
+        for name in (
+            "test_import_utils.py",
+            "test_collection_utils.py",
+            "test_cache.py",
+        )
+    ]
+    # Explicit parameter IDs keep large tensors and additional devices out.
+    for dtype in range(3):
+        for tokens in (7, 83):
+            for activation in ("silu_and_mul", "mul_and_silu", "gelu", "gelu_tanh"):
+                targets.append(
+                    f"{kernels / 'test_activation.py'}::test_act_and_mul"
+                    f"[cuda:0-0-dtype{dtype}-512-{tokens}-{activation}]"
+                )
+    for strided in (False, True):
+        for dtype in range(3):
+            for residual in (False, True):
+                for hidden in (768, 769):
+                    for tokens in (7, 83):
+                        targets.append(
+                            f"{kernels / 'test_layernorm.py'}::test_rms_norm"
+                            f"[{strided}-cuda:0-0-dtype{dtype}-{residual}-{hidden}-{tokens}]"
+                        )
+    targets.append(
+        f"{kernels / 'test_layernorm.py'}::test_gemma_rms_norm_mixed_input_weight_dtype"
+    )
+    for dtype in range(2):
+        for residual in (False, True):
+            targets.append(
+                f"{kernels / 'test_layernorm.py'}::test_fused_rms_norm_quant"
+                f"[False-cuda:0-0-1.0-dtype{dtype}-{residual}-768-7]"
+            )
+    for use_key in (False, True):
+        for dtype in range(2):
+            for rotary_dim in (None, 32):
+                for layout in ("_get_batch_tensor_shape", "_get_padded_tensor_shape"):
+                    for neox in (False, True):
+                        targets.append(
+                            f"{kernels / 'test_pos_encoding.py'}::test_rotary_embedding"
+                            f"[{use_key}-cuda:0-0-dtype{dtype}-{rotary_dim}-64-17-11-5-{layout}-{neox}]"
+                        )
+    cache = tests / "kernels" / "attention" / "test_cache.py"
+    for cache_dtype in ("auto", "fp8"):
+        for dtype in range(2):
+            for head_size in (64, 80):
+                targets.append(
+                    f"{cache}::test_reshape_and_cache"
+                    f"[{cache_dtype}-cuda:0-0-dtype{dtype}-1024-16-{head_size}-8-42]"
+                )
+    return tuple(targets)
+
+
 TEST_TARGETS = {
-    "full": Path("tests"),
+    "core": _core_test_targets(),
+    "full": ("tests",),
     "deepgemm": (
-        Path("tests") / "kernels" / "moe" / "test_silu_mul_fp8_quant_deep_gemm.py"
+        str(Path("tests") / "kernels" / "moe" / "test_silu_mul_fp8_quant_deep_gemm.py"),
     ),
 }
 
@@ -37,7 +97,7 @@ class TestResults:
         self.terminal = None
         self.summary = {
             "suite": test_suite,
-            "selected_paths": [str(TEST_TARGETS[test_suite])],
+            "selected_paths": list(TEST_TARGETS[test_suite]),
             "status": "initializing",
             "source": str(source),
             "exit_code": None,
@@ -174,12 +234,16 @@ def execute_tests(source, output, results):
         )
 
     test_suite = results.summary["suite"]
-    target = source / TEST_TARGETS[test_suite]
-    if test_suite == "deepgemm":
-        if not target.is_file():
+    targets = []
+    for selection in TEST_TARGETS[test_suite]:
+        filename, separator, node = selection.partition("::")
+        target = source / filename
+        if test_suite != "full" and not target.is_file():
             raise FileNotFoundError(
-                f"The selected vLLM commit has no DeepGEMM test module: {target}"
+                f"The selected vLLM commit has no {test_suite} test target: {target}"
             )
+        targets.append(f"{target}{separator}{node}")
+    if test_suite == "deepgemm":
         # Surface the failing kernel at its launch, not at a later synchronization.
         os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
     results.update(cuda_launch_blocking=os.environ.get("CUDA_LAUNCH_BLOCKING"))
@@ -189,9 +253,7 @@ def execute_tests(source, output, results):
     if not package.is_relative_to(Path(sys.prefix).resolve()) or package.is_relative_to(
         source
     ):
-        raise RuntimeError(
-            "Tests must import vLLM from the job's installed wheel."
-        )
+        raise RuntimeError("Tests must import vLLM from the job's installed wheel.")
 
     # Keep installed packages ahead of the checkout, including in spawned Python
     # workers and `python -m vllm...` commands launched by the tests.
@@ -204,7 +266,7 @@ def execute_tests(source, output, results):
     sys.path[:0] = [str(site_packages), str(source)]
     pytest = importlib.import_module("pytest")
     args = [
-        str(target),
+        *targets,
         "--optional",
         "--continue-on-collection-errors",
         "--maxfail=0",
@@ -217,7 +279,7 @@ def execute_tests(source, output, results):
         "-ra",
         f"--junitxml={output / 'pytest.xml'}",
     ]
-    if test_suite == "deepgemm":
+    if test_suite != "full":
         args.append("-vv")
     results.update(vllm_package=str(package), arguments=args)
     return int(pytest.main(args, plugins=[results]))
